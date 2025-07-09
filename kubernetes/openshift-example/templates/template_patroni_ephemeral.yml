@@ -36,7 +36,7 @@ objects:
     labels:
       application: ${APPLICATION_NAME}
       cluster-name: ${PATRONI_CLUSTER_NAME}
-    name: ${PATRONI_MASTER_SERVICE_NAME}
+    name: ${PATRONI_PRIMARY_SERVICE_NAME}
   spec:
     ports:
     - port: 5432
@@ -45,7 +45,7 @@ objects:
     selector:
       application: ${APPLICATION_NAME}
       cluster-name: ${PATRONI_CLUSTER_NAME}
-      role: master
+      role: primary
     sessionAffinity: None
     type: ClusterIP
   status:
@@ -118,6 +118,8 @@ objects:
               fieldRef:
                 apiVersion: v1
                 fieldPath: metadata.namespace
+          - name: PATRONI_KUBERNETES_BYPASS_API_SERVICE
+            value: 'true'
           - name: PATRONI_KUBERNETES_LABELS
             value: '{application: ${APPLICATION_NAME}, cluster-name: ${PATRONI_CLUSTER_NAME}}'
           - name: PATRONI_SUPERUSER_USERNAME
@@ -152,6 +154,16 @@ objects:
           image: docker-registry.default.svc:5000/${NAMESPACE}/patroni:latest
           imagePullPolicy: IfNotPresent
           name: ${APPLICATION_NAME}
+          readinessProbe:
+            httpGet:
+              scheme: HTTP
+              path: /readiness
+              port: 8008
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            successThreshold: 1
+            failureThreshold: 3
           ports:
           - containerPort: 8008
             protocol: TCP
@@ -240,6 +252,34 @@ objects:
   subjects:
   - kind: ServiceAccount
     name: ${SERVICE_ACCOUNT}
+# Following privileges are only required if deployed not in the "default"
+# namespace and you want Patroni to bypass kubernetes service
+# (PATRONI_KUBERNETES_BYPASS_API_SERVICE=true)
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: patroni-k8s-ep-access
+  rules:
+  - apiGroups:
+    - ""
+    resources:
+    - endpoints
+    resourceNames:
+    - kubernetes
+    verbs:
+    - get
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: ${NAMESPACE}-${SERVICE_ACCOUNT}-k8s-ep-access
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: patroni-k8s-ep-access
+  subjects:
+  - kind: ServiceAccount
+    name: ${SERVICE_ACCOUNT}
+    namespace: ${NAMESPACE}
 parameters:
 - description: The name of the application for labelling all artifacts.
   displayName: Application Name
@@ -249,12 +289,12 @@ parameters:
   displayName: Cluster Name
   name: PATRONI_CLUSTER_NAME
   value: patroni-ephemeral
-- description: The name of the OpenShift Service exposed for the patroni-ephemeral-master container.
-  displayName: Master service name.  
-  name: PATRONI_MASTER_SERVICE_NAME
-  value: patroni-ephemeral-master
+- description: The name of the OpenShift Service exposed for the patroni-ephemeral-primary container.
+  displayName: Primary service name.
+  name: PATRONI_PRIMARY_SERVICE_NAME
+  value: patroni-ephemeral-primary
 - description: The name of the OpenShift Service exposed for the patroni-ephemeral-replica containers.
-  displayName: Replica service name. 
+  displayName: Replica service name.
   name: PATRONI_REPLICA_SERVICE_NAME
   value: patroni-ephemeral-replica
 - description: Maximum amount of memory the container can use.
@@ -270,7 +310,7 @@ parameters:
   name: PATRONI_SUPERUSER_USERNAME
   value: postgres
 - description: Password of the superuser account for initialization.
-  displayName: Superuser Passsword
+  displayName: Superuser Password
   name: PATRONI_SUPERUSER_PASSWORD
   value: postgres
 - description: Username of the replication account for initialization.
@@ -278,10 +318,10 @@ parameters:
   name: PATRONI_REPLICATION_USERNAME
   value: postgres
 - description: Password of the replication account for initialization.
-  displayName: Repication Passsword
+  displayName: Repication Password
   name: PATRONI_REPLICATION_PASSWORD
   value: postgres
-- description: Service account name used for pods and rolebindings to form a cluster in the project. 
+- description: Service account name used for pods and rolebindings to form a cluster in the project.
   displayName: Service Account
   name: SERVICE_ACCOUNT
   value: patroniocp

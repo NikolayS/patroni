@@ -1,19 +1,18 @@
 import json
-import os
-import parse
 import shlex
 import subprocess
 import sys
 import time
+
+from datetime import datetime, timedelta
+
+import parse
 import yaml
 
 from behave import register_type, step, then
 from dateutil import tz
-from datetime import datetime, timedelta
-from patroni.request import PatroniRequest
 
 tzutc = tz.tzutc()
-request_executor = PatroniRequest({'ctl': {'auth': 'username:password'}})
 
 
 @parse.with_pattern(r'https?://(?:\w|\.|:|/)+')
@@ -29,8 +28,8 @@ register_type(url=parse_url)
 # just rely on the database availability, since there is
 # a short gap between the time PostgreSQL becomes available
 # and Patroni assuming the leader role.
-@step('{name:w} is a leader after {time_limit:d} seconds')
-@then('{name:w} is a leader after {time_limit:d} seconds')
+@step('{name:name} is a leader after {time_limit:d} seconds')
+@then('{name:name} is a leader after {time_limit:d} seconds')
 def is_a_leader(context, name, time_limit):
     time_limit *= context.timeout_multiplier
     max_time = time.time() + int(time_limit)
@@ -73,9 +72,13 @@ def do_post_empty(context, url):
 
 @step('I issue a {request_method:w} request to {url:url} with {data}')
 def do_request(context, request_method, url, data):
+    if context.certfile:
+        url = url.replace('http://', 'https://')
     data = data and json.loads(data)
     try:
-        r = request_executor.request(request_method, url, data)
+        r = context.request_executor.request(request_method, url, data)
+        if request_method == 'PATCH' and r.status == 409:
+            r = context.request_executor.request(request_method, url, data)
     except Exception:
         context.status_code = context.response = None
     else:
@@ -86,10 +89,7 @@ def do_request(context, request_method, url, data):
 def do_run(context, cmd):
     cmd = [sys.executable, '-m', 'coverage', 'run', '--source=patroni', '-p'] + shlex.split(cmd)
     try:
-        # XXX: Dirty hack! We need to take name/passwd from the config!
-        env = os.environ.copy()
-        env.update({'PATRONI_RESTAPI_USERNAME': 'username', 'PATRONI_RESTAPI_PASSWORD': 'password'})
-        response = subprocess.check_output(cmd, stderr=subprocess.STDOUT, env=env)
+        response = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         context.status_code = 0
     except subprocess.CalledProcessError as e:
         response = e.output
@@ -97,10 +97,10 @@ def do_run(context, cmd):
     context.response = response.decode('utf-8').strip()
 
 
-@then('I receive a response {component:w} {data}')
+@then('I receive a response {component:name} {data}')
 def check_response(context, component, data):
     if component == 'code':
-        assert context.status_code == int(data),\
+        assert context.status_code == int(data), \
             "status code {0} != {1}, response: {2}".format(context.status_code, data, context.response)
     elif component == 'returncode':
         assert context.status_code == int(data), "return code {0} != {1}, {2}".format(context.status_code,
@@ -111,13 +111,15 @@ def check_response(context, component, data):
         assert data.strip('"') in context.response, "response {0} does not contain {1}".format(context.response, data)
     else:
         assert component in context.response, "{0} is not part of the response".format(component)
+        if context.certfile:
+            data = data.replace('http://', 'https://')
         assert str(context.response[component]) == str(data), "{0} does not contain {1}".format(component, data)
 
 
-@step('I issue a scheduled switchover from {from_host:w} to {to_host:w} in {in_seconds:d} seconds')
+@step('I issue a scheduled switchover from {from_host:name} to {to_host:name} in {in_seconds:d} seconds')
 def scheduled_switchover(context, from_host, to_host, in_seconds):
     context.execute_steps(u"""
-        Given I run patronictl.py switchover batman --master {0} --candidate {1} --scheduled "{2}" --force
+        Given I run patronictl.py switchover batman --primary {0} --candidate {1} --scheduled "{2}" --force
     """.format(from_host, to_host, datetime.now(tzutc) + timedelta(seconds=int(in_seconds))))
 
 
@@ -128,21 +130,58 @@ def scheduled_restart(context, url, in_seconds, data):
     context.execute_steps(u"""Given I issue a POST request to {0}/restart with {1}""".format(url, json.dumps(data)))
 
 
-@step('I add tag {tag:w} {value:w} to {pg_name:w} config')
+@step('I {action:w} {tag:w} tag in {pg_name:name} config')
+def add_bool_tag_to_config(context, action, tag, pg_name):
+    value = action == 'set'
+    context.pctl.add_tag_to_config(pg_name, tag, value)
+
+
+@step('I add tag {tag:w} {value:w} to {pg_name:name} config')
 def add_tag_to_config(context, tag, value, pg_name):
     context.pctl.add_tag_to_config(pg_name, tag, value)
 
 
-@then('Response on GET {url} contains {value} after {timeout:d} seconds')
-def check_http_response(context, url, value, timeout, negate=False):
+@then('Status code on GET {url:url} is {code:d} after {timeout:d} seconds')
+def check_http_code(context, url, code, timeout):
+    if context.certfile:
+        url = url.replace('http://', 'https://')
     timeout *= context.timeout_multiplier
     for _ in range(int(timeout)):
-        r = request_executor.request('GET', url)
-        if (value in r.data.decode('utf-8')) != negate:
+        r = context.request_executor.request('GET', url)
+        if int(code) == int(r.status):
             break
         time.sleep(1)
     else:
-        assert False,\
+        assert False, "HTTP Status Code is not {0} after {1} seconds".format(code, timeout)
+
+
+@then('Response on GET {url:url} contains {value} after {timeout:d} seconds')
+def check_http_response(context, url, value, timeout, negate=False):
+    if context.certfile:
+        url = url.replace('http://', 'https://')
+    timeout *= context.timeout_multiplier
+    if '=' in value:
+        key, val = value.split('=', 1)
+    else:
+        key, val = value, None
+    for _ in range(int(timeout)):
+        r = context.request_executor.request('GET', url)
+        data = r.data.decode('utf-8')
+        if val is not None:
+            try:
+                data = json.loads(data)
+                if negate:
+                    if key not in data or data[key] != val:
+                        break
+                elif key in data and data[key] == val:
+                    break
+            except Exception:
+                pass
+        elif (value in r.data.decode('utf-8')) != negate:
+            break
+        time.sleep(1)
+    else:
+        assert False, \
             "Value {0} is {1} present in response after {2} seconds".format(value, "not" if not negate else "", timeout)
 
 

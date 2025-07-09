@@ -1,1 +1,5 @@
-__version__ = '1.6.4'
+"""This module specifies the current Patroni version.
+
+:var __version__: the current Patroni version.
+"""
+__version__ = '4.0.6'

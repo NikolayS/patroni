@@ -1,13 +1,14 @@
 import multiprocessing
-import psutil
 import unittest
 
-from mock import Mock, patch, mock_open
+from unittest.mock import Mock, mock_open, patch
+
+import psutil
+
 from patroni.postgresql.postmaster import PostmasterProcess
-from six.moves import builtins
 
 
-class MockProcess(object):
+class MockProcess:
     def __init__(self, target, args):
         self.target = target
         self.args = args
@@ -64,6 +65,37 @@ class TestPostmasterProcess(unittest.TestCase):
         self.assertNotEqual(PostmasterProcess.from_pid(123), None)
 
     @patch('psutil.Process.__init__', Mock())
+    @patch('psutil.wait_procs', Mock())
+    @patch('psutil.Process.suspend')
+    @patch('psutil.Process.children')
+    @patch('psutil.Process.kill')
+    def test_signal_kill(self, mock_kill, mock_children, mock_suspend):
+        proc = PostmasterProcess(123)
+
+        # all processes successfully stopped
+        mock_children.return_value = [Mock()]
+        mock_children.return_value[0].kill.side_effect = psutil.NoSuchProcess(123)
+        self.assertTrue(proc.signal_kill())
+
+        # postmaster has gone before suspend
+        mock_suspend.side_effect = psutil.NoSuchProcess(123)
+        self.assertTrue(proc.signal_kill())
+
+        # postmaster has gone before we got a list of children
+        mock_suspend.side_effect = psutil.AccessDenied()
+        mock_children.side_effect = psutil.NoSuchProcess(123)
+        self.assertTrue(proc.signal_kill())
+
+        # postmaster has gone after we got a list of children
+        mock_children.side_effect = psutil.AccessDenied()
+        mock_kill.side_effect = psutil.NoSuchProcess(123)
+        self.assertTrue(proc.signal_kill())
+
+        # failed to kill postmaster
+        mock_kill.side_effect = psutil.AccessDenied()
+        self.assertFalse(proc.signal_kill())
+
+    @patch('psutil.Process.__init__', Mock())
     @patch('psutil.Process.send_signal')
     @patch('psutil.Process.pid', Mock(return_value=123))
     @patch('os.name', 'posix')
@@ -102,14 +134,22 @@ class TestPostmasterProcess(unittest.TestCase):
         c2.cmdline = Mock(return_value=["postgres: postgres postgres [local] idle"])
         c3 = Mock()
         c3.cmdline = Mock(side_effect=psutil.NoSuchProcess(123))
-        with patch('psutil.Process.children', Mock(return_value=[c1, c2, c3])):
+        c4 = Mock()
+        c4.cmdline = Mock(return_value=['postgres: slotsync worker '])
+        mock_wait.return_value = ([], [c2])
+        with patch('psutil.Process.children', Mock(return_value=[c1, c2, c3, c4])):
             proc = PostmasterProcess(123)
-            self.assertIsNone(proc.wait_for_user_backends_to_close())
-            mock_wait.assert_called_with([c2])
+            self.assertIsNone(proc.wait_for_user_backends_to_close(1))
+            mock_wait.assert_called_with([c2], 1)
+
+        mock_wait.return_value = ([c2], [])
+        with patch('psutil.Process.children', Mock(return_value=[c1, c2, c3, c4])):
+            proc = PostmasterProcess(123)
+            proc.wait_for_user_backends_to_close(1)
 
         with patch('psutil.Process.children', Mock(side_effect=psutil.NoSuchProcess(123))):
             proc = PostmasterProcess(123)
-            self.assertIsNone(proc.wait_for_user_backends_to_close())
+            self.assertIsNone(proc.wait_for_user_backends_to_close(None))
 
     @patch('subprocess.Popen')
     @patch('os.setsid', Mock(), create=True)
@@ -132,7 +172,7 @@ class TestPostmasterProcess(unittest.TestCase):
 
     @patch('psutil.Process.__init__', Mock(side_effect=psutil.NoSuchProcess(123)))
     def test_read_postmaster_pidfile(self):
-        with patch.object(builtins, 'open', Mock(side_effect=IOError)):
+        with patch('builtins.open', Mock(side_effect=IOError)):
             self.assertIsNone(PostmasterProcess.from_pidfile(''))
-        with patch.object(builtins, 'open', mock_open(read_data='123\n')):
+        with patch('builtins.open', mock_open(read_data='123\n')):
             self.assertIsNone(PostmasterProcess.from_pidfile(''))
