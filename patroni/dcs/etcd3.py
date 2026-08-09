@@ -1,6 +1,5 @@
-from __future__ import absolute_import
-
 import base64
+import functools
 import json
 import logging
 import os
@@ -21,7 +20,8 @@ from urllib3.exceptions import ProtocolError, ReadTimeoutError
 from ..collections import EMPTY_DICT
 from ..exceptions import DCSError, PatroniException
 from ..postgresql.mpp import AbstractMPP
-from ..utils import deep_compare, enable_keepalive, iter_response_objects, RetryFailedError, USER_AGENT
+from ..utils import deep_compare, enable_keepalive, iter_response_objects, \
+    parse_bool, RetryFailedError, USER_AGENT, WHITESPACE_RE
 from . import catch_return_false_exception, Cluster, ClusterConfig, \
     Failover, Leader, Member, Status, SyncState, TimelineHistory
 from .etcd import AbstractEtcd, AbstractEtcdClientWithFailover, catch_etcd_errors, \
@@ -66,9 +66,15 @@ class Etcd3Exception(etcd.EtcdException):
     pass
 
 
+class Etcd3WatchCanceled(Etcd3Exception):
+    pass
+
+
 class Etcd3ClientError(Etcd3Exception):
 
     def __init__(self, code: Optional[int] = None, error: Optional[str] = None, status: Optional[int] = None) -> None:
+        if not hasattr(self, 'code'):
+            self.code = code
         if not hasattr(self, 'error'):
             self.error = error and error.strip()
         self.codeText = GRPCcodeToText.get(code) if code is not None else None
@@ -76,7 +82,7 @@ class Etcd3ClientError(Etcd3Exception):
 
     def __repr__(self) -> str:
         return "<{0} error: '{1}', code: {2}>"\
-            .format(self.__class__.__name__, getattr(self, 'error', None), getattr(self, 'code', None))
+            .format(self.codeText, getattr(self, 'error', None), getattr(self, 'code', None))
 
     __str__ = __repr__
 
@@ -159,18 +165,23 @@ def _raise_for_data(data: Union[bytes, str, Dict[str, Any]], status_code: Option
         data_error: Optional[Dict[str, Any]] = data.get('error') or data.get('Error')
         if isinstance(data_error, dict):  # streaming response
             status_code = data_error.get('http_code')
-            code: Optional[int] = data_error['grpc_code']
+            code: Optional[int] = data_error.get('code') or data_error['grpc_code']
             error: str = data_error['message']
         else:
             data_code = data.get('code') or data.get('Code')
             if TYPE_CHECKING:  # pragma: no cover
                 assert not isinstance(data_code, dict)
             code = data_code
-            error = str(data_error)
+            error = str(data_error or data.get('message') or data)
     except Exception:
         error = str(data)
         code = GRPCCode.Unknown
-    err = errStringToClientError.get(error) or errCodeToClientError.get(code) or Unknown
+
+    # Workaround for etcd-io/etcd#21671
+    if code == GRPCCode.Unknown and error == 'not a primary lessor':
+        code = GRPCCode.Unavailable
+
+    err = errStringToClientError.get(error) or errCodeToClientError.get(code) or Etcd3ClientError
     return err(code, error, status_code)
 
 
@@ -213,13 +224,24 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
     ERROR_CLS = Etcd3Error
 
     def __init__(self, config: Dict[str, Any], dns_resolver: DnsCachingResolver, cache_ttl: int = 300) -> None:
+        self._decoder = json.JSONDecoder()
         self._reauthenticate = False
         self._token = None
         self._cluster_version: Tuple[int, ...] = tuple()
         super(Etcd3Client, self).__init__({**config, 'version_prefix': '/v3beta'}, dns_resolver, cache_ttl)
+        if self._use_proxies and not self._cluster_version:
+            kwargs = self._prepare_common_parameters(1)
+            self._ensure_version_prefix(self._base_uri, **kwargs)
+            self.authenticate_on_start()
 
+    def authenticate_on_start(self, auth_request_func: Optional[Callable[..., Dict[str, Any]]] = None):
+        """Authenticate with Etcd v3 at startup and exit on invalid credentials.
+
+        :param auth_request_func: optional custom authentication request function,
+                                  if not provided, :meth:`call_rpc` will be used.
+        """
         try:
-            self.authenticate()
+            self.authenticate(auth_request_func=auth_request_func)
         except AuthFailed as e:
             logger.fatal('Etcd3 authentication failed: %r', e)
             sys.exit(1)
@@ -241,7 +263,8 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
         data = response.data
         try:
             data = data.decode('utf-8')
-            ret: Dict[str, Any] = json.loads(data)
+            idx = WHITESPACE_RE.match(data, 0).end()  # pyright: ignore [reportOptionalMemberAccess]
+            ret: Dict[str, Any] = self._decoder.raw_decode(data, idx)[0]
 
             header = ret.get('header', EMPTY_DICT)
             self._check_cluster_raft_term(header.get('cluster_id'), header.get('raft_term'))
@@ -250,7 +273,7 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
                 return ret
         except (TypeError, ValueError, UnicodeError) as e:
             if response.status < 400:
-                raise etcd.EtcdException('Server response was not valid JSON: %r' % e)
+                raise etcd.EtcdException("Server response '%s' was not valid JSON: %r" % (data, e))
             ret = {}
         ex = _raise_for_data(ret or data, response.status)
         if isinstance(ex, Unavailable):
@@ -293,26 +316,82 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
         self._prepare_request(kwargs, {})
         return kwargs
 
+    def _do_auth_request(self, base_uri: str, kwargs: Dict[str, Any],
+                         method: str, fields: Dict[str, Any], retry: Optional[Retry] = None) -> Dict[str, Any]:
+        """Special method for handling authentication when discovering cluster members.
+
+        We can't use `call_rpc()` method for this purpose because it may cause infinite recursion.
+
+        :param base_uri: base url for authentication request, e.g. `http://etcd:2379/v3`
+        :param kwargs: common request parameters, e.g. headers.
+        :param method: `/auth/authenticate`
+        :param fields: authentication fields, e.g. `{'name': 'user', 'password': 'pass'}`.
+        :param retry: optional retry configuration, ignored.
+        """
+        request_kwargs = kwargs.copy()
+        request_kwargs['headers'] = {k: v for k, v in kwargs['headers'].items() if k != 'authorization'}
+        self._prepare_request(request_kwargs, fields)
+        response = self.http.urlopen(self._MPOST, base_uri + method, **request_kwargs)
+        return self._handle_server_response(response)
+
+    def _do_member_list_request(self, url: str, retry: Optional[Retry] = None, **kwargs: Any) -> Any:
+        """Special method for handling member list requests.
+
+        :param url: base url for member list request, e.g. `http://etcd:2379/v3/cluster/member/list`
+        :param kwargs: common request parameters, e.g. headers.
+        :param retry: optional retry configuration, ignored.
+        """
+        request_kwargs = kwargs.copy()
+        request_kwargs['headers'] = kwargs['headers'].copy()
+        # We want to update headers with authentication token if it was obtained during authentication request.
+        request_kwargs['headers'].update(self._get_headers())
+        response = self.http.urlopen(self._MPOST, url, **request_kwargs)
+        return self._handle_server_response(response)
+
     def _get_members(self, base_uri: str, **kwargs: Any) -> List[str]:
         self._ensure_version_prefix(base_uri, **kwargs)
-        resp = self.http.urlopen(self._MPOST, base_uri + self.version_prefix + '/cluster/member/list', **kwargs)
-        members = self._handle_server_response(resp)['members']
-        return [url for member in members for url in member.get('clientURLs', [])]
+        base_uri += self.version_prefix
+
+        retry = None
+        if self._update_machines_cache:
+            retry = Retry(deadline=self._config['retry_timeout'], max_delay=1, max_tries=-1)
+            # handle_auth_errors() calls retry.ensure_deadline(), which expects Retry.__call__()
+            # to have initialized the internal deadline state first.
+            retry(lambda: None)
+
+        # custom authentication request function, because we can't use `call_rpc()` method
+        # for this purpose as it may cause infinite recursion
+        auth_request_func = functools.partial(self._do_auth_request, base_uri, kwargs)
+
+        # if _machine_cache is empty, it means we are just starting and want to exit early if authentication fails.
+        if not self._machines_cache:
+            self.authenticate_on_start(auth_request_func)
+
+        response = self.handle_auth_errors(Etcd3Client._do_member_list_request, base_uri + '/cluster/member/list',
+                                           auth_request_func=auth_request_func, retry=retry, **kwargs)
+        return [url for member in response['members'] for url in member.get('clientURLs', [])]
 
     def call_rpc(self, method: str, fields: Dict[str, Any], retry: Optional[Retry] = None) -> Dict[str, Any]:
         fields['retry'] = retry
         return self.api_execute(self.version_prefix + method, self._MPOST, fields)
 
-    def authenticate(self, *, retry: Optional[Retry] = None) -> bool:
-        if self._use_proxies and not self._cluster_version:
-            kwargs = self._prepare_common_parameters(1)
-            self._ensure_version_prefix(self._base_uri, **kwargs)
+    def authenticate(self, *, retry: Optional[Retry] = None,
+                     auth_request_func: Optional[Callable[..., Dict[str, Any]]] = None) -> bool:
+        """Authenticate with the Etcd v3 cluster.
+
+        :param retry: optional retry configuration.
+        :param auth_request_func: optional custom authentication request function,
+                                  if not provided, `call_rpc()` method will be used.
+        """
         if not (self._cluster_version >= (3, 3) and self.username and self.password):
             return False
+        if not auth_request_func:
+            auth_request_func = self.call_rpc
         logger.info('Trying to authenticate on Etcd...')
         old_token, self._token = self._token, None
         try:
-            response = self.call_rpc('/auth/authenticate', {'name': self.username, 'password': self.password}, retry)
+            response = auth_request_func('/auth/authenticate',
+                                         {'name': self.username, 'password': self.password}, retry)
         except AuthNotEnabled:
             logger.info('Etcd authentication is not enabled')
             self._token = None
@@ -324,13 +403,23 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
         return old_token != self._token
 
     def handle_auth_errors(self: 'Etcd3Client', func: Callable[..., Any], *args: Any,
+                           auth_request_func: Optional[Callable[..., Dict[str, Any]]] = None,
                            retry: Optional[Retry] = None, **kwargs: Any) -> Any:
+        """Handle authentication errors for the given function.
+
+        :param func: function to call.
+        :param args: positional arguments for the function.
+        :param auth_request_func: optional custom authentication request function,
+                                  if not provided, `call_rpc()` method will be used.
+        :param retry: optional retry configuration.
+        :param kwargs: keyword arguments for the function.
+        """
         reauthenticated = False
         exc = None
         while True:
             if self._reauthenticate:
                 if self.username and self.password:
-                    self.authenticate(retry=retry)
+                    self.authenticate(retry=retry, auth_request_func=auth_request_func)
                     self._reauthenticate = False
                 else:
                     msg = 'Username or password not set, authentication is not possible'
@@ -356,7 +445,6 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
                 exc = e
             self._reauthenticate = True
             if retry:
-                logger.error('retry = %s', retry)
                 retry.ensure_deadline(0.5, exc)
             elif reauthenticated:
                 raise exc
@@ -375,6 +463,7 @@ class Etcd3Client(AbstractEtcdClientWithFailover):
     def lease_grant(self, ttl: int, *, retry: Optional[Retry] = None) -> str:
         return self.call_rpc('/lease/grant', {'TTL': ttl}, retry)['ID']
 
+    @_handle_auth_errors
     def lease_keepalive(self, ID: str, *, retry: Optional[Retry] = None) -> Optional[str]:
         return self.call_rpc('/lease/keepalive', {'ID': ID}, retry).get('result', {}).get('TTL')
 
@@ -508,6 +597,8 @@ class KVCache(StaleEtcdNodeGuard, Thread):
         if 'error' in message:
             raise _raise_for_data(message)
         result = message.get('result', EMPTY_DICT)
+        if parse_bool(result.get('canceled')):
+            raise Etcd3WatchCanceled('Watch canceled')
         header = result.get('header', EMPTY_DICT)
         self._check_cluster_raft_term(header.get('cluster_id'), header.get('raft_term'))
         events: List[Dict[str, Any]] = result.get('events', [])
@@ -555,8 +646,10 @@ class KVCache(StaleEtcdNodeGuard, Thread):
 
         try:
             self._do_watch(result['header']['revision'])
+        except Etcd3WatchCanceled:
+            logger.info('Watch request canceled')
         except Exception as e:
-            # Following exceptions are expected on Windows because the /watch request  is done with `read_timeout`
+            # Following exceptions are expected on Windows because the /watch request is done with `read_timeout`
             if not (os.name == 'nt' and isinstance(e, (ReadTimeoutError, ProtocolError))):
                 logger.error('watchprefix failed: %r', e)
         finally:
@@ -576,16 +669,21 @@ class KVCache(StaleEtcdNodeGuard, Thread):
                 time.sleep(1)
 
     def kill_stream(self) -> None:
-        sock = None
+        conn_sock: Any = None
         with self._response_lock:
             if isinstance(self._response, urllib3.response.HTTPResponse):
                 try:
-                    sock = self._response.connection.sock if self._response.connection else None
+                    conn_sock = self._response.connection.sock if self._response.connection else None
                 except Exception:
-                    sock = None
+                    conn_sock = None
             else:
                 self._response = False
-        if sock:
+        if conn_sock:
+            # python-etcd forces usage of pyopenssl if the last one is available.
+            # In this case HTTPConnection.socket is not inherited from socket.socket, but urllib3 uses custom
+            # class `WrappedSocket`, which shutdown() method could be incompatible with socket.shutdown().
+            # Therefore we use WrappedSocket.socket, which points to original `socket` object.
+            sock: socket.socket = conn_sock.socket if conn_sock.__class__.__name__ == 'WrappedSocket' else conn_sock
             try:
                 sock.shutdown(socket.SHUT_RDWR)
                 sock.close()

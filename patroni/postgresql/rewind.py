@@ -6,17 +6,27 @@ import shutil
 import subprocess
 
 from enum import IntEnum
-from threading import Lock, Thread
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from .. import thread_pool
 from ..async_executor import CriticalTask
 from ..collections import EMPTY_DICT
 from ..dcs import Leader, RemoteMember
+from ..utils import process_user_options
 from . import Postgresql
 from .connection import get_connection_cursor
 from .misc import format_lsn, fsync_dir, parse_history, parse_lsn, PostgresqlRole
 
 logger = logging.getLogger(__name__)
+
+# Message format depends on the major version:
+# - v19 changed LSN formatting in error messages
+# - expected at least -- starting from v16
+# - wanted -- before v16
+# - nothing (end of message) 9.5 and older
+WALDUMP_ERROR_RE = re.compile(r"^.*error in WAL record at ([0-9A-Fa-f]+/[0-9A-Fa-f]+): invalid record "
+                              "length at ([0-9A-Fa-f]+/[0-9A-Fa-f]+)")  # (?:: expected at least |: wanted |$)
 
 
 class REWIND_STATUS(IntEnum):
@@ -51,16 +61,26 @@ class Rewind(object):
         """
         # low-hanging fruit: check if pg_rewind configuration is there
         if not self.enabled:
+            logger.debug('pg_rewind is not possible: use_pg_rewind is not enabled in Patroni configuration')
             return False
 
         cmd = [self._postgresql.pgcommand('pg_rewind'), '--help']
         try:
             ret = subprocess.call(cmd, stdout=open(os.devnull, 'w'), stderr=subprocess.STDOUT)
             if ret != 0:  # pg_rewind is not there, close up the shop and go home
+                logger.debug('pg_rewind is not possible: pg_rewind command returned non-zero exit code %s', ret)
                 return False
-        except OSError:
+        except OSError as e:
+            logger.debug('pg_rewind is not possible: pg_rewind command is not accessible: %s', e)
             return False
-        return self.configuration_allows_rewind(self._postgresql.controldata())
+        data = self._postgresql.controldata()
+        if not self.configuration_allows_rewind(data):
+            logger.debug('pg_rewind is not possible: neither wal_log_hints nor data checksums are enabled'
+                         ' (wal_log_hints=%s, data_checksums=%s)',
+                         data.get('wal_log_hints setting', 'off'),
+                         data.get('Data page checksum version', '0'))
+            return False
+        return True
 
     @property
     def should_remove_data_directory_on_diverged_timelines(self) -> bool:
@@ -71,15 +91,19 @@ class Rewind(object):
         return self.should_remove_data_directory_on_diverged_timelines or self.can_rewind
 
     def trigger_check_diverged_lsn(self) -> None:
-        if self.can_rewind_or_reinitialize_allowed and self._state != REWIND_STATUS.NEED:
+        allowed = self.can_rewind_or_reinitialize_allowed
+        if allowed and self._state != REWIND_STATUS.NEED:
             self._state = REWIND_STATUS.CHECK
+        elif not allowed:
+            logger.debug('not checking diverged timeline: pg_rewind is not possible'
+                         ' and remove_data_directory_on_diverged_timelines is not enabled')
         with self._checkpoint_task_lock:
             self._checkpoint_task = None
 
     @staticmethod
     def check_leader_is_not_in_recovery(conn_kwargs: Dict[str, Any]) -> Optional[bool]:
         try:
-            with get_connection_cursor(connect_timeout=3, options='-c statement_timeout=2000', **conn_kwargs) as cur:
+            with get_connection_cursor(**conn_kwargs) as cur:
                 cur.execute('SELECT pg_catalog.pg_is_in_recovery()')
                 row = cur.fetchone()
                 if not row or not row[0]:
@@ -91,7 +115,7 @@ class Rewind(object):
     @staticmethod
     def check_leader_has_run_checkpoint(conn_kwargs: Dict[str, Any]) -> Optional[str]:
         try:
-            with get_connection_cursor(connect_timeout=3, options='-c statement_timeout=2000', **conn_kwargs) as cur:
+            with get_connection_cursor(**conn_kwargs) as cur:
                 cur.execute("SELECT NOT pg_catalog.pg_is_in_recovery()"
                             " AND ('x' || pg_catalog.substr(pg_catalog.pg_walfile_name("
                             " pg_catalog.pg_current_wal_lsn()), 1, 8))::bit(32)::int = timeline_id"
@@ -130,22 +154,12 @@ class Rewind(object):
         if out is not None and err is not None:
             out = out.decode('utf-8').rstrip().split('\n')
             err = err.decode('utf-8').rstrip().split('\n')
-            pattern = 'error in WAL record at {0}: invalid record length at '.format(lsn_str)
 
-            if len(out) == 1 and len(err) == 1 and ', lsn: {0}, prev '.format(lsn8) in out[0] and pattern in err[0]:
-                i = err[0].find(pattern) + len(pattern)
-                # Message format depends on the major version:
-                # * expected at least -- starting from v16
-                # * wanted -- before v16
-                # * nothing (end of message) 9.5 and older
-                # We will simply check all possible combinations.
-                for pattern in (': expected at least ', ': wanted ', '\n'):
-                    j = (err[0] + '\n').find(pattern, i)
-                    if j > -1:
-                        try:
-                            return parse_lsn(err[0][i:j])
-                        except Exception as e:
-                            logger.error('Failed to parse lsn %s: %r', err[0][i:j], e)
+            if len(out) == 1 and len(err) == 1 and ', lsn: {0}, prev '.format(lsn8) in out[0]:
+                m = WALDUMP_ERROR_RE.match(err[0])
+                if m and parse_lsn(m.group(1)) == lsn:
+                    return parse_lsn(m.group(2))
+
             logger.error('Failed to parse pg_%sdump output', self._postgresql.wal_name)
             logger.error(' stdout=%s', '\n'.join(out))
             logger.error(' stderr=%s', '\n'.join(err))
@@ -179,11 +193,19 @@ class Rewind(object):
         return in_recovery, timeline, lsn
 
     def _get_local_timeline_lsn(self) -> Tuple[Optional[bool], Optional[int], Optional[int]]:
+        in_recovery = timeline = lsn = None
         if self._postgresql.is_running():  # if postgres is running - get timeline from replication connection
+            try:
+                timeline = self._postgresql.get_replica_timeline()
+                lsn = self._postgresql.replay_lsn()
+            except Exception:
+                if not self._postgresql.is_starting():
+                    return None, None, None
+                logger.info('PostgreSQL is still starting, will use pg_controldata as a fallback')
             in_recovery = True
-            timeline = self._postgresql.get_replica_timeline()
-            lsn = self._postgresql.replay_lsn()
-        else:  # otherwise analyze pg_controldata output
+
+        if timeline is None and lsn is None:
+            # analyze pg_controldata output if not running or not accepting connections
             in_recovery, timeline, lsn = self._get_local_timeline_lsn_from_controldata()
 
         log_lsn = format_lsn(lsn) if isinstance(lsn, int) else lsn
@@ -322,10 +344,20 @@ class Rewind(object):
                     self._state = REWIND_STATUS.CHECKPOINT
                 else:
                     self._checkpoint_task = CriticalTask()
-                    Thread(target=self.__checkpoint, args=(self._checkpoint_task, wakeup)).start()
+                    thread_pool.get_executor().submit(self.__checkpoint, self._checkpoint_task, wakeup)
 
     def checkpoint_after_promote(self) -> bool:
         return self._state == REWIND_STATUS.CHECKPOINT
+
+    def get_archive_command(self) -> Optional[str]:
+        """Get ``archive_command`` GUC value if defined and archiving is enabled.
+
+        :returns: ``archive_command`` defined in the Postgres configuration or None.
+        """
+        archive_mode = self._postgresql.get_guc_value('archive_mode')
+        archive_cmd = self._postgresql.get_guc_value('archive_command')
+        if archive_mode in ('on', 'always') and archive_cmd:
+            return archive_cmd
 
     def _build_archiver_command(self, command: str, wal_filename: str) -> str:
         """Replace placeholders in the given archiver command's template.
@@ -380,9 +412,8 @@ class Rewind(object):
         after it the WALs were recycled on the promoted replica.
         With this we prevent the entire loss of such WALs and the
         consequent old leader's start failure."""
-        archive_mode = self._postgresql.get_guc_value('archive_mode')
-        archive_cmd = self._postgresql.get_guc_value('archive_command')
-        if archive_mode not in ('on', 'always') or not archive_cmd:
+        archive_cmd = self.get_archive_command()
+        if not archive_cmd:
             return
 
         walseg_regex = re.compile(r'^[0-9A-F]{24}(\.partial){0,1}\.ready$')
@@ -434,6 +465,10 @@ class Rewind(object):
 
         :returns: ``True`` if ``pg_rewind`` finished successfully, ``False`` otherwise.
         """
+        options = self._postgresql.config.get('rewind', [])
+        not_allowed_options = ('target-pgdata', 'source-pgdata', 'source-server', 'write-recovery-conf', 'dry-run',
+                               'restore-target-wal', 'config-file', 'no-ensure-shutdown', 'version', 'help')
+        user_options = process_user_options('rewind', options, not_allowed_options, logger.error)
         # prepare pg_rewind connection string
         env = self._postgresql.config.write_pgpass(conn_kwargs)
         env.update(LANG='C', LC_ALL='C', PGOPTIONS='-c statement_timeout=0')
@@ -457,6 +492,7 @@ class Rewind(object):
                 cmd.append('--config-file={0}'.format(self._postgresql.config.postgresql_conf))
 
         cmd.extend(['-D', self._postgresql.data_dir, '--source-server', dsn])
+        cmd.extend(user_options)
 
         while True:
             results: Dict[str, bytes] = {}
@@ -602,3 +638,17 @@ class Rewind(object):
             logger.info(' stdout=%s', output['stdout'].decode('utf-8'))
             logger.info(' stderr=%s', output['stderr'].decode('utf-8'))
         return ret == 0 or None
+
+    def archive_shutdown_checkpoint_wal(self, archive_cmd: str) -> None:
+        """Archive WAL file with the shutdown checkpoint.
+
+        :param archive_cmd: archiver command to use
+        """
+        data = self._postgresql.controldata()
+        wal_file = data.get("Latest checkpoint's REDO WAL file", '')
+        if not wal_file:
+            logger.error("Cannot extract latest checkpoint's WAL file name")
+            return
+        cmd = self._build_archiver_command(archive_cmd, wal_file)
+        if self._postgresql.cancellable.call([cmd], shell=True):
+            logger.error("Failed to archive WAL file with the shutdown checkpoint")

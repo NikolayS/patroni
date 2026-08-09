@@ -3,6 +3,301 @@
 Release notes
 =============
 
+Version 4.1.4
+-------------
+
+Released 2026-07-07
+
+**Bugfixes**
+
+- Check ``NOTIFY_SOCKET`` environment variable before using ``systemd`` package (Polina Bungina)
+
+  Only try to import and use the package when the ``NOTIFY_SOCKET`` environment variable is set to avoid ``FileNotFoundError: [Errno 2] No such file or directory`` exception.
+
+- Unify ``pg_replication_slots`` query (Polina Bungina)
+
+  Incorrect handling of the ``failover`` and ``synced`` values was resulting in ``KeyError`` exceptions during removal of the incorrect logical replication slots.
+
+- Consider version-specific authentication parameters in configuration generation (Polina Bungina)
+
+  In the ``patroni --generate-config`` command, remove all inapplicable authentication parameters that were accidentally picked up from the environment, based on the version retrieved from a PostgreSQL connection.
+
+- Handle ``pg_rewind`` while a PostgreSQL instance is starting as a standby (Alexander Kukushkin)
+
+  Fallback to ``pg_controldata`` information when a PostgreSQL instance is running but is not yet accepting connections.
+
+- Fix Prometheus metric type for ``patroni_postgres_timeline`` (Huseyin Demir)
+
+  Declare the ``patroni_postgres_timeline`` metric as ``gauge`` instead of ``counter``, as it is not always monotonically increasing (e.g., it can be reset to 0 if a PostgreSQL instance is not running).
+
+- Don't stop watchdog until client backends are fully stopped (Alexander Kukushkin)
+
+  Previously, if ``primary_stop_timeout`` was shorter than the minimum watchdog timeout, and the stop timeout actually expired, Patroni disabled the watchdog before all client backends had exited.
+
+- Handle statement timeout error for monitoring query (Alexander Kukushkin)
+
+  In case of a statement timeout error, use the cached role as a fallback to avoid demoting the primary. Additionally, forcibly set ``pg_stat_statements.track`` to ``none`` for the monitroing query to avoid expensive ``pg_stat_statements`` GC calls.
+
+- Drop Patroni-managed replication slots with ``wal_status=lost`` (Alexander Kukushkin)
+
+  Replication slots with ``wal_status=lost`` are no longer usable. Patroni will now drop such slots and recreate them if needed.
+
+- Fix role representation in patronictl member validation error (Polina Bungina)
+
+  Ensures the correct string representation is used within the exception message, preventing errors from being formatted like ``Error: No CtlPostgresqlRole.REPLICA among provided members``.
+
+
+Version 4.1.3
+-------------
+
+Released 2026-05-05
+
+**Stability improvements**
+
+- Properly handle mislabeled Etcd error (Ants Aasma)
+
+  Current Etcd versions raise ``Unknown`` error when Etcd leader is lost while updating the lease. Patroni will now override the reported error code to ``Unavailable``.
+
+**Bugfixes**
+
+- Use binary version when ``PG_VERSION`` file does not exist (Polina Bungina)
+
+  In some cases, for example when using custom bootstrap, the ``PG_VERSION`` file may not be present in the data directory. In this case, Patroni was treating the version as 0.0, which was causing issues with some of the version-specific logic. With this fix, Patroni will try to get the version from the binary in such cases.
+
+- Refactor logger intialization to avoid missing early log messages (Alexander Kukushkin)
+
+  Create ``PatroniLogger`` before loading ``Config`` to capture early log messages.
+
+- Include ``MONOTONIC_USEC`` in ``RELOADING=1`` systemd notification (Alexander Kukushkin)
+
+  systemd 257+ requires ``MONOTONIC_USEC`` alongside ``RELOADING=1`` for ``Type=notify-reload`` services. Without it, ``systemctl reload`` hangs indefinitely.
+
+**Improvements**
+
+- Skip single-user crash recovery when ``backup_label`` exists (Vadim Ponomarev)
+
+  Skip single-user crash recovery and let PostgreSQL handle it during normal startup when starting a replica restored from an external backup (not using a custom bootstrap method).
+
+- Warn when running under ``systemd`` without ``python-systemd`` package (Alexander Kukushkin)
+
+  Instead of logging "systemd integration is not supported" at startup, check for ``NOTIFY_SOCKET`` and warn only when actually running under ``systemd`` without the ``python-systemd`` package installed.
+
+
+Version 4.1.2
+-------------
+
+Released 2026-04-21
+
+**Systemd support improvements**
+
+- Add support for ``notify-reload`` systemd unit type (Ronan Dunklau)
+
+  Allows ``systemctl reload`` to wait until Patroni has actually processed the configuration reload by sending ``RELOADING=1`` and ``READY=1`` notifications to systemd.
+
+- Send ``STOPPING=1`` notification to systemd on shutdown (Alexander Kukushkin)
+
+  Patroni now properly notifies systemd that it is shutting down, following the systemd notify protocol.
+
+- Do not let PostgreSQL to notify systemd (Alexander Kukushkin)
+
+  Remove ``NotifyAccess=all`` from the example systemd unit file. Filter ``NOTIFY_SOCKET`` from the environment when starting PostgreSQL so it doesn't send ``READY=1`` or ``STOPPING=1`` to systemd. When taking over a PostgreSQL that was started before Patroni and already has ``NOTIFY_SOCKET``, re-assert ``READY=1`` during PostgreSQL shutdown to counteract its ``STOPPING=1``.
+
+
+Version 4.1.1
+-------------
+
+Released 2026-04-08
+
+**Stability improvements**
+
+- Compatibility with threading changes in python 3.11+ (Alexander Kukushkin)
+
+  Avoid starting/stopping threads at runtime. Introduce thread pools for REST API and for executing async tasks. Allow configuring global ``thread_pool_size`` and ``restapi.thread_pool_size``.
+
+- Compatibility with python 3.14 (Alexander Kukushkin)
+
+  Run tests against python 3.14 and fix compatibility issues.
+
+- Compatibility with Etcd security fixes in v3.6.9, v3.5.28, and v3.4.42 (Alexander Kukushkin)
+
+  These Etcd releases addressed CVEs and changed behavior so cluster topology reads and lease keepalive are no longer allowed without authentication. Patroni now handles this by authenticating in member-discovery and lease-keepalive paths, re-authenticating on auth failures, and retrying requests accordingly.
+
+- Improvements for Etcd3 error handling (Alexander Kukushkin)
+
+  Handle broken JSON responses, be flexible in how JSON error is parsed, and improve reporting for etcd internal errors.
+
+**Bugfixes**
+
+- Retry leader update on temporary Kubernetes ``403`` error (Sophia Ruan, Alexander Kukushkin)
+
+  When the Kubernetes API temporarily returns ``403 Permission Denied`` (for example during transient RBAC issues), Patroni now verifies whether the current node still holds leadership and retries the leader update within ``retry_timeout`` instead of immediately demoting.
+
+- Fix issue with renaming leader node in sync mode and pause (Alexander Kukushkin)
+
+  ``/sync`` key wasn't updated after renaming the leader node with Patroni restart in pause (without Postgres restart). It prevented Patroni from promoting after the next restart without pause.
+
+- Trigger ``pg_rewind`` check when the same primary increased timeline (Alexander Kukushkin)
+
+  Such timeline increase may happen as a result of crash recovery in a single user mode + promote after taking a leader key while other replica nodes are isolated from DCS. In this case replica nodes didn't trigger ``pg_rewind`` state machine because the leader and therefore ``primary_conninfo`` didn't change.
+
+- Only write superuser password during ``initdb`` bootstrap if it is non-empty (Michael Banck)
+
+  Writing an empty password during ``initdb`` bootstrap was causing issues.
+
+- Fix bug with ``failover_priority`` with ``synchronous_mode=on`` (Alexander Kukushkin)
+
+  ``tag.failover_priority`` values were ignored when ``synchronous_node_count > 1``.
+
+- Fix bug with ``primary_conninfo`` password comparison (Alexander Kukushkin)
+
+  Starting from PostgreSQL 10, Patroni uses passfile in ``primary_conninfo`` and failed to update the passfile after the replication password was updated in yaml-file configuration with reload.
+
+- Don't restart replica with ``nofailover`` tag in pause mode (Alexander Kukushkin)
+
+  Patroni used to start a manually shut down PostgreSQL replica in pause mode when it had ``nofailover`` tag set to ``true``.
+
+- Fix ``check_recovery_conf()`` when PostgreSQL is in the starting state (Alexander Kukushkin)
+
+  For PostgreSQL v12 and newer, ``pg_settings`` cannot be queried while the server is still starting and not yet accepting connections. Missing recovery parameters are now added to the internal state when writing ``postgresql.conf``. Additionally, restore the ``Postgresql.is_starting()`` check in ``Ha.is_healthiest_node()``.
+
+- Validate user options in dictionary format for ``initdb``/``basebackup`` (m4rrypro)
+
+  When ``initdb`` or ``basebackup`` options were provided as a dictionary (instead of a list), the ``option_is_allowed()`` validation was bypassed, allowing blocked options to be used.
+
+- Allow server-side compression for ``basebackup`` option (m4rrypro)
+
+  The ``compress`` option was completely blocked for ``basebackup``, but since PostgreSQL 15, server-side compression is useful and works transparently with plain format. Client-side compression is still rejected.
+
+- Don't reload PostgreSQL config while running custom bootstrap (Alexander Kukushkin)
+
+  Custom bootstrap could be complex and involve PosgreSQL starting and stopping multiple times. Reloads of PostgreSQL config during this process could lead to unexpected behavior.
+
+- Check that ``postgresql.parameters`` is a dictionary (Alexander Kukushkin)
+
+  Discard new config if ``postgresql.parameters`` is not a dictionary.
+
+
+Version 4.1.0
+-------------
+
+Released 2025-09-23
+
+**New features**
+
+- Add support for systemd "notify" unit type (Ronan Dunklau)
+
+  Without a notify unit type, it is possible to start Patroni and immediately send it a SIGHUP signal using systemd, effectively killing it before it had time to set up its signal handlers.
+
+- Provide receive and replay LSN/lag information in API and ctl (Polina Bungina)
+
+  Patroni REST API ``/cluster`` endpoint and ``patronictl list`` command now provide receive LSN, replay LSN, receive lag, and replay lag information for each replica member.
+
+- Ensure clean demotion to standby cluster (Polina Bungina)
+
+  Make sure the introduction of the ``standby_cluster`` section in the dynamic configuration leads to a clean cluster demotion.
+
+- Implement ``patronictl demote-cluster`` and ``promote-cluster`` commands (Polina Bungina)
+
+  New commands for cluster demotion and promotion handle both the dynamic configuration editing and checking the result status.
+
+- Implement ``sync_priority`` tag (Polina Bungina)
+
+  This parameter controls the priority a member should have during synchronous replica selection when ``synchronous_mode`` is set to ``on``.
+
+- Implement ``--print`` option for ``--validate-config`` (Polina Bungina)
+
+  Print out local configuration (including environment configuration overrides) after it has been successfully validated.
+
+- Implement ``kubernetes.bootstrap_labels`` (Polina Bungina)
+
+  This feature allows you to define labels that will be assigned to a member pod when in ``initializing new cluster``, ``running custom bootstrap script``, ``starting after custom bootstrap``, or ``creating replica`` state.
+
+- Add configuration option to suppress duplicate heartbeat logs (Michael Morris)
+
+  If set to ``true``, successive heartbeat logs that are identical shall not be output.
+
+- Add optional ``cluster_type`` attribute to permanent replication slots (Michael Banck)
+
+  This allows you to set whether a particular permanent replication slot should always be created, or just on a primary or standby cluster.
+
+- Make HTTP Server header configurable (David Grierson)
+
+  Introduce the ``restapi.server_tokens`` configuration parameter that allows you to restrict information disclosed in the HTTP Server header.
+
+- Implement readiness API checks for replication on replica members (Ants Aasma)
+
+  The previous implementation considered replicas ready as soon as PostgreSQL was started. With this change, a replica pod is only considered ready when PostgreSQL is replicating and is not too far behind the leader.
+
+
+**Improvements**
+
+- Reduce log level of watchdog configuration failure (Ants Aasma)
+
+  Show the `Could not activate Linux watchdog device` log line on debug logging level, unless the watchdog is configured with ``required`` mode. It was previously shown on info level.
+
+- Take advantage of ``written_lsn`` and ``latest_end_lsn`` from ``pg_stat_wal_receiver`` (Alexander Kukushkin)
+
+  ``written_lsn``, the actual write LSN, is now preferred over the one returned by ``pg_last_wal_receive_lsn()``, which is in fact the flush LSN. ``latest_end_lsn`` points to WAL flush on the source host. In case of a primary, it allows better calculation of the replay lag, because values stored in DCS are updated only every ``loop_wait`` seconds.
+
+- Avoid interactions with slots created with the ``failover=true`` option (Alexander Kukushkin)
+
+  This change is required to make the logical failover slots feature fully functional.
+
+- Add PostgreSQL state to ``/metrics`` REST API endpoint (Ivan Filianin)
+
+  PostgreSQL instance state information is now available in the Prometheus format output of the ``/metrics`` REST API endpoint.
+
+
+Version 4.0.7
+-------------
+
+Released 2025-09-22
+
+**New features**
+
+- Add support for PostgreSQL 18 RC1 (Alexander Kukushkin)
+
+  GUC's validator rules were extended. Patroni now properly handles the new background I/O worker.
+
+
+**Bugfixes**
+
+- Fix potential issue around resolving localhost to IPv6 on Windows (András Váczi)
+
+  When configuring ``listen_addresses`` in PostgreSQL, using ``0.0.0.0`` or ``127.0.0.1`` will restrict listening to IPv4 only, excluding IPv6. On typical Windows systems, however, ``localhost`` often resolves to the IPv6 address ``::1`` by default. To ensure compatibility, Patroni now configures PostgreSQL to listen on ``127.0.0.1``, instead of ``localhost``, on Windows systems.
+
+- Return global config only when ``/config`` key exists in DCS (Alexander Kukushkin)
+
+  Patroni REST API was returning an empty configuration instead of raising an error if the ``/config`` key was missing in DCS.
+
+- Fix the issue of failsafe mode not being triggered in case of Etcd unavailability (Alexander Kukushkin)
+
+  Patroni was not always properly handling ``etcd3`` exceptions, which resulted in failsafe mode not being triggered.
+
+- Fix signal handler reentrancy deadlock (Waynerv)
+
+  Patroni running in a Docker container with ``PID=1`` in some special cases was experiencing deadlock after receiving ``SIGCHLD``.
+
+- Recreate (permanent) physical slot when it doesn't reserve WAL (Israel Barth Rubio)
+
+  Permanent physical replication slots created outside of Patroni scope without reserving WALs were causing a ``replication slot cannot be advanced`` error. To avoid this, Patroni now recreates such slots.
+
+- Handle watch cancelation messages in ``etcd3`` properly (Alexander Kukushkin)
+
+  When ``etcd3`` sends a cancelation message to the watch channel, it doesn't close the connection. This results in Patroni using stale data. Patroni now solves it by breaking a loop of reading chunked response and closing the connection on the Patroni side.
+
+- Handle case when ``HTTPConnection`` socket is wrapped with ``pyopenssl`` (Alexander Kukushkin)
+
+  Patroni was not correctly using ``pyopenssl`` interfaces, enforced in ``python-etcd``.
+
+
+**Documentation improvements**
+
+- Improve 2-node cluster guidance (Nikolay Samokhvalov)
+
+  Clarify behaviour during failover and DCS requirements.
+
+
 Version 4.0.6
 -------------
 

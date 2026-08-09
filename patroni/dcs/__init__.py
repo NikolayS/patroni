@@ -18,7 +18,8 @@ import dateutil.parser
 
 from .. import global_config
 from ..dynamic_loader import iter_classes, iter_modules
-from ..exceptions import PatroniFatalException
+from ..exceptions import PatroniAssertionError, PatroniFatalException
+from ..site import ClusterSite
 from ..tags import Tags
 from ..utils import deep_compare, parse_int, uri
 
@@ -130,7 +131,7 @@ def get_dcs(config: Union['Config', Dict[str, Any]]) -> 'AbstractDCS':
     for name, dcs_class in iter_dcs_classes(config):
         # Propagate some parameters from top level of config if defined to the DCS specific config section.
         config[name].update({
-            p: config[p] for p in ('namespace', 'name', 'scope', 'loop_wait',
+            p: config[p] for p in ('namespace', 'name', 'scope', 'site', 'loop_wait',
                                    'patronictl', 'ttl', 'retry_timeout')
             if p in config})
 
@@ -199,10 +200,13 @@ class Member(Tags, NamedTuple('Member',
             data = {'conn_url': conn_url, 'api_url': api_url}
         else:
             try:
-                data = json.loads(value)
-                assert isinstance(data, dict)
-            except (AssertionError, TypeError, ValueError):
-                data: Dict[str, Any] = {}
+                json_data = json.loads(value)
+                if isinstance(json_data, dict):
+                    data = cast(Dict[str, Any], json_data)
+                else:
+                    raise PatroniAssertionError('not a dict')
+            except (PatroniAssertionError, TypeError, ValueError):
+                data = {}
         return Member(version, name, session, data)
 
     @property
@@ -255,8 +259,10 @@ class Member(Tags, NamedTuple('Member',
             self.data['conn_kwargs'] = ret.copy()
 
         # apply any remaining authentication parameters
+        # we skip options and connect_timeout to prevent injection via config file
         if auth and isinstance(auth, dict):
-            ret.update({k: v for k, v in cast(Dict[str, Any], auth).items() if v is not None})
+            ret.update({k: v for k, v in cast(Dict[str, Any], auth).items()
+                        if k not in ('options', 'connect_timeout') and v is not None})
             if 'username' in auth:
                 ret['user'] = ret.pop('username')
         return ret
@@ -299,7 +305,7 @@ class Member(Tags, NamedTuple('Member',
         """``True`` if the member :attr:`~Member.state` is :class:`~patroni.postgresql.misc.PostgresqlState.RUNNING`."""
         from ..postgresql.misc import PostgresqlState
 
-        return self.state == PostgresqlState.RUNNING
+        return self.state == PostgresqlState.RUNNING.value
 
     @property
     def patroni_version(self) -> Optional[Tuple[int, ...]]:
@@ -331,6 +337,10 @@ class Member(Tags, NamedTuple('Member',
     @property
     def replay_lsn(self) -> Optional[int]:
         return parse_int(self.data.get('replay_lsn'))
+
+    @property
+    def site(self) -> Optional[str]:
+        return self.data.get('site')
 
 
 class RemoteMember(Member):
@@ -494,9 +504,12 @@ class Failover(NamedTuple):
             data: Dict[str, Any] = value
         elif value:
             try:
-                data = json.loads(value)
-                assert isinstance(data, dict)
-            except AssertionError:
+                json_data = json.loads(value)
+                if isinstance(json_data, dict):
+                    data = cast(Dict[str, Any], json_data)
+                else:
+                    raise PatroniAssertionError('not a dict')
+            except PatroniAssertionError:
                 data = {}
             except ValueError:
                 t = [a.strip() for a in value.split(':')]
@@ -561,10 +574,13 @@ class ClusterConfig(NamedTuple):
             False
         """
         try:
-            data = json.loads(value)
-            assert isinstance(data, dict)
-        except (AssertionError, TypeError, ValueError):
-            data: Dict[str, Any] = {}
+            json_data = json.loads(value)
+            if isinstance(json_data, dict):
+                data = cast(Dict[str, Any], json_data)
+            else:
+                raise PatroniAssertionError('not a dict')
+        except (PatroniAssertionError, TypeError, ValueError):
+            data = {}
             modify_version = 0
         return ClusterConfig(version, data, version if modify_version is None else modify_version)
 
@@ -617,11 +633,12 @@ class SyncState(NamedTuple):
         try:
             if value and isinstance(value, str):
                 value = json.loads(value)
-            assert isinstance(value, dict)
+            if not isinstance(value, dict):
+                raise PatroniAssertionError('not a dict')
             leader = value.get('leader')
             quorum = value.get('quorum')
             return SyncState(version, leader, value.get('sync_standby'), int(quorum) if leader and quorum else 0)
-        except (AssertionError, TypeError, ValueError):
+        except (PatroniAssertionError, TypeError, ValueError):
             return SyncState.empty(version)
 
     @staticmethod
@@ -751,10 +768,13 @@ class TimelineHistory(NamedTuple):
             []
         """
         try:
-            lines = json.loads(value)
-            assert isinstance(lines, list)
-        except (AssertionError, TypeError, ValueError):
-            lines: List[_HistoryTuple] = []
+            json_lines = json.loads(value)
+            if isinstance(json_lines, list):
+                lines = cast(List[_HistoryTuple], json_lines)
+            else:
+                raise PatroniAssertionError('not a list')
+        except (PatroniAssertionError, TypeError, ValueError):
+            lines = []
         return TimelineHistory(version, value, lines)
 
 
@@ -766,10 +786,12 @@ class Status(NamedTuple):
     :ivar last_lsn: :class:`int` object containing position of last known leader LSN.
     :ivar slots: state of permanent replication slots on the primary in the format: ``{"slot_name": int}``.
     :ivar retain_slots: list physical replication slots for members that exist in the cluster.
+    :ivar current_site: the name of the site where leader is located.
     """
     last_lsn: int
     slots: Optional[Dict[str, int]]
     retain_slots: List[str]
+    current_site: Optional[str]
 
     @staticmethod
     def empty() -> 'Status':
@@ -777,14 +799,14 @@ class Status(NamedTuple):
 
         :returns: empty :class:`Status` object.
         """
-        return Status(0, None, [])
+        return Status(0, None, [], None)
 
     def is_empty(self):
         """Validate definition of all attributes of this :class:`Status` instance.
 
         :returns: ``True`` if all attributes of the current :class:`Status` are unpopulated.
         """
-        return self.last_lsn == 0 and self.slots is None and not self.retain_slots
+        return self.last_lsn == 0 and self.slots is None and not self.retain_slots and self.current_site is None
 
     @staticmethod
     def from_node(value: Union[str, Dict[str, Any], None]) -> 'Status':
@@ -801,7 +823,7 @@ class Status(NamedTuple):
             return Status.empty()
 
         if isinstance(value, int):  # legacy
-            return Status(value, None, [])
+            return Status(value, None, [], None)
 
         if not isinstance(value, dict):
             return Status.empty()
@@ -829,7 +851,7 @@ class Status(NamedTuple):
         if not isinstance(retain_slots, list):
             retain_slots = []
 
-        return Status(last_lsn, slots, retain_slots)
+        return Status(last_lsn, slots, retain_slots, value.get('current_site'))
 
 
 class Cluster(NamedTuple('Cluster',
@@ -905,7 +927,7 @@ class Cluster(NamedTuple('Cluster',
 
            >>> assert bool(cluster) is False
 
-           >>> status = Status(0, None, [])
+           >>> status = Status(0, None, [], 'dc1')
            >>> cluster = Cluster(None, None, None, status, [1, 2, 3], None, SyncState.empty(), None, None, {})
            >>> len(cluster)
            1
@@ -949,17 +971,26 @@ class Cluster(NamedTuple('Cluster',
         return next((m for m in self.members if m.name == member_name),
                     self.leader if fallback_to_leader else None)
 
-    def get_clone_member(self, exclude_name: str) -> Union[Member, Leader, None]:
+    def get_clone_member(self, exclude_name: str, site: Optional[str]) -> Union[Member, Leader, None]:
         """Get member or leader object to use as clone source.
 
         :param exclude_name: name of a member name to exclude.
+        :param site: the site to which the clone member should belong.
 
         :returns: a randomly selected candidate member from available running members that are configured to as viable
                  sources for cloning (has tag ``clonefrom`` in configuration). If no member is appropriate the current
-                 leader is used.
+                 leader is used. If there is neither replica nor leader in the requested site, chose among all available
+                 members.
         """
         exclude = [exclude_name] + ([self.leader.name] if self.leader else [])
+
         candidates = [m for m in self.members if m.clonefrom and m.is_running and m.name not in exclude]
+        local_candidates = [m for m in candidates if (site is None or m.site == site)]
+        if len(local_candidates) > 0:
+            candidates = local_candidates
+        elif self.leader and site and self.leader.member.site == site:
+            # prefer local leader over remote replicas
+            candidates = [self.leader]
         return candidates[randint(0, len(candidates) - 1)] if candidates else self.leader
 
     @staticmethod
@@ -1429,7 +1460,7 @@ def catch_return_false_exception(func: Callable[..., Any]) -> Any:
     return wrapper
 
 
-class AbstractDCS(abc.ABC):
+class AbstractDCS(ClusterSite, abc.ABC):
     """Abstract representation of DCS modules.
 
     Implementations of a concrete DCS class, using appropriate backend client interfaces, must include the following
@@ -1518,6 +1549,8 @@ class AbstractDCS(abc.ABC):
                        i.e.: ``zookeeper`` for zookeeper, ``etcd`` for etcd, etc...
         :param mpp: an object implementing :class:`AbstractMPP` interface.
         """
+        ClusterSite.__init__(self, config.get('site'))
+
         self._mpp = mpp
         self._name = config['name']
         self._base_path = re.sub('/+', '/', '/'.join(['', config.get('namespace', 'service'), config['scope']]))
@@ -1756,7 +1789,8 @@ class AbstractDCS(abc.ABC):
             self._cluster_valid_till = time.time() + self.ttl
 
             self._last_seen = int(time.time())
-            self._last_status = {self._OPTIME: cluster.status.last_lsn, 'retain_slots': cluster.status.retain_slots}
+            self._last_status = {self._OPTIME: cluster.status.last_lsn, 'retain_slots': cluster.status.retain_slots,
+                                 'current_site': cluster.status.current_site}
             if cluster.status.slots:
                 self._last_status['slots'] = cluster.status.slots
             self._last_failsafe = cluster.failsafe
@@ -1818,7 +1852,7 @@ class AbstractDCS(abc.ABC):
         """
         # This method is always called with ``optime`` key, rest of the keys are optional.
         # In case if we know old values (stored in self._last_status), we will copy them over.
-        for name in ('slots', 'retain_slots'):
+        for name in ('slots', 'retain_slots', 'current_site'):
             if name not in value and self._last_status.get(name):
                 value[name] = self._last_status[name]
         # if the key is present, but the value is None, we will not write such pair.
@@ -1934,6 +1968,8 @@ class AbstractDCS(abc.ABC):
         if ret and last_lsn:
             status: Dict[str, Any] = {self._OPTIME: last_lsn, 'slots': slots or None,
                                       'retain_slots': self._build_retain_slots(cluster, slots)}
+            if self.site:
+                status['current_site'] = self.site
             self.write_status(status)
 
         if ret and failsafe is not None:

@@ -8,6 +8,7 @@ import glob
 import inspect
 import logging
 import os
+import re
 import sys
 
 from setuptools import Command, find_packages, setup
@@ -36,7 +37,6 @@ CLASSIFIERS = [
     'Environment :: Console',
     'Intended Audience :: Developers',
     'Intended Audience :: System Administrators',
-    'License :: OSI Approved :: MIT License',
     'Operating System :: MacOS',
     'Operating System :: POSIX :: Linux',
     'Operating System :: POSIX :: BSD :: FreeBSD',
@@ -51,6 +51,7 @@ CLASSIFIERS = [
     'Programming Language :: Python :: 3.11',
     'Programming Language :: Python :: 3.12',
     'Programming Language :: Python :: 3.13',
+    'Programming Language :: Python :: 3.14',
     'Programming Language :: Python :: Implementation :: CPython',
 ]
 
@@ -206,8 +207,9 @@ def main():
         author_email=AUTHOR_EMAIL,
         description=DESCRIPTION,
         license=LICENSE,
+        license_files=('LICENSE',),
         keywords=KEYWORDS,
-        long_description=read('README.rst'),
+        long_description=re.sub(r'\n\n\.\. image:: docs/[^\n]*(?:\n   [^\n]+)*', '', read('README.rst')),
         classifiers=CLASSIFIERS,
         packages=find_packages(exclude=['tests', 'tests.*']),
         package_data={MAIN_PACKAGE: [

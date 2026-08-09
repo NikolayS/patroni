@@ -13,17 +13,20 @@ from argparse import Namespace
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from patroni import global_config, MIN_PSYCOPG2, MIN_PSYCOPG3, parse_version
+from patroni.collections import EMPTY_DICT
 from patroni.daemon import abstract_main, AbstractPatroniDaemon, get_base_arg_parser
+from patroni.site import ClusterSite
 from patroni.tags import Tags
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import Config
     from .dcs import Cluster
+    from .log import PatroniLogger
 
 logger = logging.getLogger(__name__)
 
 
-class Patroni(AbstractPatroniDaemon, Tags):
+class Patroni(AbstractPatroniDaemon, ClusterSite, Tags):
     """Implement ``patroni`` command daemon.
 
     :ivar version: Patroni version.
@@ -39,7 +42,7 @@ class Patroni(AbstractPatroniDaemon, Tags):
         * ``postmaster_start_time``: timestamp when Postgres was last started.
     """
 
-    def __init__(self, config: 'Config') -> None:
+    def __init__(self, config: 'Config', patroni_logger: 'PatroniLogger') -> None:
         """Create a :class:`Patroni` instance with the given *config*.
 
         Get a connection to the DCS, configure watchdog (if required), set up Patroni interface with Postgres, configure
@@ -49,7 +52,9 @@ class Patroni(AbstractPatroniDaemon, Tags):
             Expected to be instantiated and run through :func:`~patroni.daemon.abstract_main`.
 
         :param config: Patroni configuration.
+        :param patroni_logger: the logging handler for this daemon.
         """
+        from patroni import thread_pool
         from patroni.api import RestApiServer
         from patroni.dcs import get_dcs
         from patroni.ha import Ha
@@ -58,7 +63,16 @@ class Patroni(AbstractPatroniDaemon, Tags):
         from patroni.version import __version__
         from patroni.watchdog import Watchdog
 
-        super(Patroni, self).__init__(config)
+        try:
+            thread_pool_size = max(5, int(config.get('thread_pool_size', 5)))
+        except Exception as e:
+            logger.warning('Failed to parse thread_pool_size value "%s": %r', config.get('thread_pool_size'), e)
+            thread_pool_size = 5
+        logger.info('Patroni global thread_pool_size = %d', thread_pool_size)
+        thread_pool.configure_global_pool(thread_pool_size)
+
+        AbstractPatroniDaemon.__init__(self, config, patroni_logger)
+        ClusterSite.__init__(self, config.get('site'))
 
         self.version = __version__
         self.dcs = get_dcs(self.config)
@@ -80,6 +94,9 @@ class Patroni(AbstractPatroniDaemon, Tags):
         self._tags = self._get_tags()
         self.next_run = time.time()
         self.scheduled_restart: Dict[str, Any] = {}
+
+        self._last_effective_role = None
+        self._last_effective_pg_config = self.config['postgresql']
 
     def ensure_dcs_access(self, sleep_time: int = 5) -> 'Cluster':
         """Continuously attempt to retrieve cluster from DCS with delay.
@@ -129,15 +146,15 @@ class Patroni(AbstractPatroniDaemon, Tags):
         member = cluster.get_member(self.config['name'], False)
         if not isinstance(member, Member):
             return
+        # Silence annoying WARNING: Retrying (...) messages when Patroni is quickly restarted.
+        configured_loggers: Dict[str, Any] = (self.config.get('log') or EMPTY_DICT).get('loggers') or {}
         try:
-            # Silence annoying WARNING: Retrying (...) messages when Patroni is quickly restarted.
-            # At this moment we don't have custom log levels configured and hence shouldn't lose anything useful.
-            self.logger.update_loggers({'urllib3.connectionpool': 'ERROR'})
+            self.logger.update_loggers({**configured_loggers, 'urllib3.connectionpool': 'ERROR'})
             _ = self.request(member, endpoint="/liveness", timeout=3)
             logger.fatal("Can't start; there is already a node named '%s' running", self.config['name'])
             sys.exit(1)
         except Exception:
-            self.logger.update_loggers({})
+            self.logger.update_loggers(configured_loggers)
 
     def _get_tags(self) -> Dict[str, Any]:
         """Get tags configured for this node, if any.
@@ -160,6 +177,8 @@ class Patroni(AbstractPatroniDaemon, Tags):
         :param sighup: if it is related to a SIGHUP signal.
         :param local: if there has been changes to the local configuration file.
         """
+        from patroni.config import ROLE_CONFIG_SUFFIX_MAP
+
         try:
             super(Patroni, self).reload_config(sighup, local)
             if local:
@@ -168,7 +187,10 @@ class Patroni(AbstractPatroniDaemon, Tags):
             if local or sighup and self.api.reload_local_certificate():
                 self.api.reload_config(self.config['restapi'])
             self.watchdog.reload_config(self.config)
-            self.postgresql.reload_config(self.config['postgresql'], sighup)
+            self._last_effective_role = ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role)
+            self._last_effective_pg_config = \
+                self.config.build_effective_postgresql_configuration(self.postgresql.role)
+            self.postgresql.reload_config(self._last_effective_pg_config, sighup)
             self.dcs.reload_config(self.config)
         except Exception:
             logger.exception('Failed to reload config_file=%s', self.config.config_file)
@@ -212,13 +234,21 @@ class Patroni(AbstractPatroniDaemon, Tags):
         the change and cache the new dynamic configuration values in ``patroni.dynamic.json`` file under Postgres data
         directory.
         """
+        from patroni.config import ROLE_CONFIG_SUFFIX_MAP
         from patroni.postgresql.misc import PostgresqlRole
+        from patroni.utils import deep_compare
 
         logger.info(self.ha.run_cycle())
 
         if self.dcs.cluster and self.dcs.cluster.config and self.dcs.cluster.config.data \
                 and self.config.set_dynamic_configuration(self.dcs.cluster.config):
             self.reload_config()
+        elif self._last_effective_role != ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role):
+            self._last_effective_role = ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role)
+            new_effective_pg_config = self.config.build_effective_postgresql_configuration(self.postgresql.role)
+            if not deep_compare(self._last_effective_pg_config, new_effective_pg_config):
+                self._last_effective_pg_config = new_effective_pg_config
+                self.postgresql.reload_config(self._last_effective_pg_config)
 
         if self.postgresql.role != PostgresqlRole.UNINITIALIZED:
             self.config.save_cache()
@@ -230,6 +260,8 @@ class Patroni(AbstractPatroniDaemon, Tags):
 
         Shut down the REST API and the HA handler.
         """
+        from patroni import thread_pool
+
         try:
             self.api.shutdown()
         except Exception:
@@ -238,6 +270,8 @@ class Patroni(AbstractPatroniDaemon, Tags):
             self.ha.shutdown()
         except Exception:
             logger.exception('Exception during Ha.shutdown')
+
+        thread_pool.get_executor().shutdown(wait=False)
 
 
 def patroni_main(configfile: str) -> None:
@@ -406,6 +440,12 @@ def main() -> None:
         if pid:
             os.kill(pid, signo)
 
+    import multiprocessing
+    patroni = multiprocessing.Process(target=patroni_main, args=(args.configfile,))
+    patroni.start()
+    pid = patroni.pid
+
+    # Set up signal handlers after fork to prevent child from inheriting them
     if os.name != 'nt':
         signal.signal(signal.SIGCHLD, sigchld_handler)
         signal.signal(signal.SIGHUP, passtochild)
@@ -415,11 +455,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, passtochild)
     signal.signal(signal.SIGABRT, passtochild)
     signal.signal(signal.SIGTERM, passtochild)
-
-    import multiprocessing
-    patroni = multiprocessing.Process(target=patroni_main, args=(args.configfile,))
-    patroni.start()
-    pid = patroni.pid
     patroni.join()
 
 

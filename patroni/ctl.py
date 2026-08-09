@@ -12,7 +12,6 @@
     If it is also missing in the configuration file we assume that this is just a normal Patroni cluster (not Citus).
 """
 
-import codecs
 import copy
 import datetime
 import difflib
@@ -30,7 +29,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse
 
 import click
@@ -63,7 +62,7 @@ except ImportError:  # pragma: no cover
 
 from . import global_config
 from .config import Config
-from .dcs import AbstractDCS, Cluster, get_dcs as _get_dcs, Member
+from .dcs import AbstractDCS, Cluster, get_dcs as _get_dcs, Leader, Member
 from .exceptions import PatroniException
 from .postgresql.misc import postgres_version_to_int, PostgresqlRole, PostgresqlState
 from .postgresql.mpp import get_mpp
@@ -317,6 +316,7 @@ option_default_citus_group = click.option('--group', required=False, type=int, h
                                           default=lambda: _get_configuration().get('citus', {}).get('group'))
 option_citus_group = click.option('--group', required=False, type=int, help='Citus group')
 role_choice = click.Choice([role.value for role in CtlPostgresqlRole])
+option_site = click.option('--site', help='Filter members by site', required=False, type=str, default=None)
 
 
 @click.group(cls=click.Group)
@@ -512,11 +512,14 @@ def watching(w: bool, watch: Optional[int], max_count: Optional[int] = None, cle
         return
 
     counter = 1
+    yield_time = time.time()
     while watch and counter <= (max_count or counter):
-        time.sleep(watch)
+        elapsed = time.time() - yield_time
+        time.sleep(max(0, watch - elapsed))
         counter += 1
         if clear:
             click.clear()
+        yield_time = time.time()
         yield 0
 
 
@@ -719,7 +722,7 @@ def get_members(cluster: Cluster, cluster_name: str, member_names: List[str], ro
     if member_names:
         member_names = list(set(member_names) & candidates)
         if not member_names:
-            raise PatroniCtlException('No {0} among provided members'.format(role))
+            raise PatroniCtlException('No {0} among provided members'.format(repr(role)))
     elif action != 'reinitialize':
         member_names = list(candidates)
 
@@ -1198,8 +1201,10 @@ def restart(cluster_name: str, group: Optional[int], member_names: List[str],
 @option_citus_group
 @click.argument('member_names', nargs=-1)
 @option_force
+@click.option('--from-leader', is_flag=True, help='Get basebackup from leader')
 @click.option('--wait', help='Wait until reinitialization completes', is_flag=True)
-def reinit(cluster_name: str, group: Optional[int], member_names: List[str], force: bool, wait: bool) -> None:
+def reinit(cluster_name: str, group: Optional[int], member_names: List[str], force: bool,
+           from_leader: bool, wait: bool) -> None:
     """Process ``reinit`` command of ``patronictl`` utility.
 
     Reinitialize cluster members based on given filters.
@@ -1211,6 +1216,7 @@ def reinit(cluster_name: str, group: Optional[int], member_names: List[str], for
     :param group: filter which Citus group we should reinit members. Refer to the module note for more details.
     :param member_names: name of the members that should be reinitialized.
     :param force: perform the restart without asking for confirmations.
+    :param from_leader: perform the reinit to get basebackup from the leader node.
     :param wait: wait for the operation to complete.
     """
     cluster = get_dcs(cluster_name, group).get_cluster()
@@ -1219,7 +1225,7 @@ def reinit(cluster_name: str, group: Optional[int], member_names: List[str], for
 
     wait_on_members: List[Member] = []
     for member in members:
-        body: Dict[str, bool] = {'force': force}
+        body: Dict[str, bool] = {'force': force, 'from_leader': from_leader}
         while True:
             r = request_patroni(member, 'post', 'reinitialize', body)
             started = check_response(r, member.name, 'reinitialize')
@@ -1393,7 +1399,9 @@ def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[i
             logging.debug(cluster)
             click.echo('{0} {1}'.format(timestamp(), r.data.decode('utf-8')))
         else:
-            click.echo('{0} failed, details: {1}, {2}'.format(action.title(), r.status, r.data.decode('utf-8')))
+            details = r.data.decode('utf-8')
+            result = 'result unknown' if 'status unknown' in details.lower() else 'failed'
+            click.echo('{0} {1}, details: {2}, {3}'.format(action.title(), result, r.status, details))
             return
     except Exception:
         logging.exception(r)
@@ -1555,12 +1563,13 @@ def get_cluster_service_info(cluster: Dict[str, Any]) -> List[str]:
 
 
 def output_members(cluster: Cluster, name: str, extended: bool = False,
-                   fmt: str = 'pretty', group: Optional[int] = None) -> None:
+                   fmt: str = 'pretty', group: Optional[int] = None, site: Optional[str] = None) -> None:
     """Print information about the Patroni cluster and its members.
 
     Information is printed to console through :func:`print_output`, and contains:
 
         * ``Cluster``: name of the Patroni cluster, as per ``scope`` configuration;
+        * ``Site``: site of the Patroni node, as per ``site`` configuration;
         * ``Member``: name of the Patroni node, as per ``name`` configuration;
         * ``Host``: hostname (or IP) and port, as per ``postgresql.listen`` configuration;
         * ``Role``: ``Leader``, ``Standby Leader``, ``Sync Standby`` or ``Replica``;
@@ -1588,6 +1597,7 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
         ``topology`` nor ``pretty``, then complementary information gathered through :func:`get_cluster_service_info` is
         not printed.
     :param group: filter which Citus group we should get members from. If ``None`` get from all groups.
+    :param site: filter which site of the cluster we should get members from.  If ``None`` get from all sites.
     """
     rows: List[List[Any]] = []
     logging.debug(cluster)
@@ -1609,6 +1619,10 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
         if extended or any(m.get(c.lower().replace(' ', '_')) for m in all_members):
             columns.append(c)
 
+    cluster_sites = set(m.get('site') for m in all_members)
+    if len(cluster_sites) > 1:
+        columns.insert(1, 'Site')
+
     # Show Host as 'host:port' if somebody is running on non-standard port or two nodes are running on the same host
     append_port = any('port' in m and m['port'] != 5432 for m in all_members) or\
         len(set(m['host'] for m in all_members)) < len(all_members)
@@ -1617,6 +1631,9 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
     for g, c in sorted(clusters.items()):
         for member in sort(c['members']):
             logging.debug(member)
+
+            if site and member.get('site') != site:
+                continue
 
             def format_diff(param: str, values: Dict[str, str], hide_long: bool):
                 full_diff = param + ': ' + values['old_value'] + '->' + values['new_value']
@@ -1645,7 +1662,8 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
                           receive_lag=receive_lag, replay_lag=replay_lag,
                           receive_lsn=receive_lsn, replay_lsn=replay_lsn,
                           pending_restart='*' if member.get('pending_restart') else '',
-                          pending_restart_reason=restart_reason)
+                          pending_restart_reason=restart_reason,
+                          site=member.get('site', ''))
 
             if append_port and member['host'] and member.get('port'):
                 member['host'] = ':'.join([member['host'], str(member['port'])])
@@ -1665,7 +1683,9 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
         title = 'Cluster'
         title_details = f' ({initialize})'
 
-    title = f' {title}: {name}{title_details} '
+    site = next(iter(cluster_sites)) if len(cluster_sites) == 1 else ''
+    site = f'Site: {site}, ' if site else ''
+    title = f' {site}{title}: {name}{title_details} '
     if fmt in ('pretty', 'topology'):
         columns[columns.index('Replay Lag')] = columns[columns.index('Receive Lag')] = 'Lag'
     print_output(columns, rows,
@@ -1687,11 +1707,12 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
 @option_citus_group
 @click.option('--extended', '-e', help='Show some extra information', is_flag=True)
 @click.option('--timestamp', '-t', 'ts', help='Print timestamp', is_flag=True)
+@option_site
 @option_format
 @option_watch
 @option_watchrefresh
 def members(cluster_names: List[str], group: Optional[int], fmt: str,
-            watch: Optional[int], w: bool, extended: bool, ts: bool) -> None:
+            watch: Optional[int], w: bool, extended: bool, ts: bool, site: Optional[str]) -> None:
     """Process ``list`` command of ``patronictl`` utility.
 
     Print information about the Patroni cluster through :func:`output_members`.
@@ -1721,7 +1742,7 @@ def members(cluster_names: List[str], group: Optional[int], fmt: str,
             dcs = get_dcs(cluster_name, group)
 
             cluster = dcs.get_cluster()
-            output_members(cluster, cluster_name, extended, fmt, group)
+            output_members(cluster, cluster_name, extended, fmt, group, site)
 
 
 @ctl.command('topology', help='Prints ASCII topology for given cluster')
@@ -1912,7 +1933,7 @@ def resume(cluster_name: str, group: Optional[int], wait: bool) -> None:
 
 
 @contextmanager
-def temporary_file(contents: bytes, suffix: str = '', prefix: str = 'tmp') -> Iterator[str]:
+def temporary_file(contents: bytes, suffix: str = '', prefix: str = 'tmp') -> Generator[str, None, None]:
     """Create a temporary file with specified contents that persists for the context.
 
     :param contents: binary string that will be written to the file.
@@ -2123,7 +2144,7 @@ def invoke_editor(before_editing: str, cluster_name: str) -> Tuple[str, Dict[str
         if ret:
             raise PatroniCtlException("Editor exited with return code {0}".format(ret))
 
-        with codecs.open(tmpfile, encoding='utf-8') as fd:
+        with open(tmpfile, encoding='utf-8') as fd:
             after_editing = fd.read()
 
         return after_editing, yaml.safe_load(after_editing)
@@ -2314,3 +2335,115 @@ def format_pg_version(version: int) -> str:
         return "{0}.{1}.{2}".format(version // 10000, version // 100 % 100, version % 100)
     else:
         return "{0}.{1}".format(version // 10000, version % 100)
+
+
+def change_cluster_role(cluster_name: str, force: bool, standby_config: Optional[Dict[str, Any]]) -> None:
+    """Demote or promote cluster.
+
+    :param cluster_name: name of the Patroni cluster.
+    :param force: if ``True`` run cluster demotion without asking for confirmation.
+    :param standby_config: standby cluster configuration to be applied if demotion is requested.
+    """
+    demote = bool(standby_config)
+    action_name = 'demot' if demote else 'promot'
+    target_role = PostgresqlRole.STANDBY_LEADER if demote else PostgresqlRole.PRIMARY
+
+    dcs = get_dcs(cluster_name, None)
+    cluster = dcs.get_cluster()
+    leader_name = cluster.leader and cluster.leader.name
+    if not leader_name:
+        raise PatroniCtlException(f'Cluster has no leader, {action_name}ion is not possible')
+    if cluster.leader and cluster.leader.data.get('role') == target_role:
+        raise PatroniCtlException('Cluster is already in the required state')
+
+    click.echo('Current cluster topology')
+    output_members(cluster, cluster_name)
+    if not force:
+        confirm = click.confirm(f'Are you sure you want to {action_name}e {cluster_name} cluster?')
+        if not confirm:
+            raise PatroniCtlException(f'Aborted cluster {action_name}ion')
+
+    try:
+        if TYPE_CHECKING:  # pragma: no cover
+            assert isinstance(cluster.leader, Leader)
+        r = request_patroni(cluster.leader.member, 'patch', 'config', {'standby_cluster': standby_config})
+
+        if r.status != 200:
+            raise PatroniCtlException(
+                f'Failed to {action_name}e {cluster_name} cluster: '
+                f'/config PATCH status code={r.status}, ({r.data.decode("utf-8")})')
+    except Exception as err:
+        raise PatroniCtlException(f'Failed to {action_name}e {cluster_name} cluster: {err}')
+
+    for _ in watching(True, 1, clear=False):
+        cluster = dcs.get_cluster()
+        is_unlocked = cluster.is_unlocked()
+        leader_role = cluster.leader and cluster.leader.data.get('role')
+        leader_state = cluster.leader and cluster.leader.data.get('state')
+        old_leader = cluster.get_member(leader_name, False)
+        old_leader_state = old_leader and old_leader.data.get('state')
+
+        if not is_unlocked and leader_role == target_role and leader_state == PostgresqlState.RUNNING:
+            if not demote or old_leader_state == PostgresqlState.RUNNING:
+                click.echo(
+                    f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} cluster is successfully {action_name}ed')
+                break
+
+        state_prts = [f'{datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")} cluster is unlocked: {is_unlocked}',
+                      f'leader role: {leader_role}',
+                      f'leader state: {leader_state}']
+        if demote and cluster.leader and leader_name != cluster.leader.name and old_leader_state:
+            state_prts.append(f'previous leader state: {repr(old_leader_state)}')
+        click.echo(", ".join(state_prts))
+    output_members(cluster, cluster_name)
+
+
+@ctl.command('demote-cluster', help="Demote cluster to a standby cluster")
+@arg_cluster_name
+@option_force
+@click.option('--host', help='Address of the remote node', required=False)
+@click.option('--port', help='Port of the remote node', type=int, required=False)
+@click.option('--restore-command', help='Command to restore WAL records from the remote primary', required=False)
+@click.option('--primary-slot-name', help='Name of the slot on the remote node to use for replication', required=False)
+def demote_cluster(cluster_name: str, force: bool, host: Optional[str], port: Optional[int],
+                   restore_command: Optional[str], primary_slot_name: Optional[str]) -> None:
+    """Process ``demote-cluster`` command of ``patronictl`` utility.
+
+    Demote cluster to a standby cluster.
+
+    :param cluster_name: name of the Patroni cluster.
+    :param force: if ``True`` run cluster demotion without asking for confirmation.
+    :param host: address of the remote node.
+    :param port: port of the remote node.
+    :param restore_command: command to restore WAL records from the remote primary'.
+    :param primary_slot_name: name of the slot on the remote node to use for replication.
+
+    :raises:
+        :class:`PatroniCtlException`: if:
+            * neither ``host`` nor ``port`` nor ``restore_command`` is provided; or
+            * cluster has no leader; or
+            * cluster is already in the required state; or
+            * operation is aborted.
+    """
+    if not any((host, port, restore_command)):
+        raise PatroniCtlException('At least --host, --port or --restore-command should be specified')
+
+    data = {k: v for k, v in {'host': host,
+                              'port': port,
+                              'primary_slot_name': primary_slot_name,
+                              'restore_command': restore_command}.items() if v}
+    change_cluster_role(cluster_name, force, data)
+
+
+@ctl.command('promote-cluster', help="Promote cluster, make it run standalone")
+@arg_cluster_name
+@option_force
+def promote_cluster(cluster_name: str, force: bool) -> None:
+    """Process ``promote-cluster`` command of ``patronictl`` utility.
+
+    Promote cluster, make it run standalone.
+
+    :param cluster_name: name of the Patroni cluster.
+    :param force: if ``True`` run cluster demotion without asking for confirmation.
+    """
+    change_cluster_role(cluster_name, force, None)

@@ -20,7 +20,6 @@ import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address, ip_network, IPv4Network, IPv6Network
 from socketserver import ThreadingMixIn
-from threading import Thread
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import parse_qs, urlparse
 
@@ -31,6 +30,7 @@ from .__main__ import Patroni
 from .dcs import Cluster
 from .exceptions import PostgresConnectionException, PostgresException
 from .postgresql.misc import postgres_version_to_int, PostgresqlRole, PostgresqlState
+from .thread_pool import PatroniThreadPoolExecutor
 from .utils import cluster_as_json, deep_compare, enable_keepalive, parse_bool, \
     parse_int, patch_config, Retry, RetryFailedError, split_host_port, tzutc, uri
 
@@ -119,6 +119,16 @@ class RestApiHandler(BaseHTTPRequestHandler):
         self.__start_time: float = 0.0
         self.path_query: Dict[str, List[str]] = {}
 
+    def version_string(self) -> str:
+        """Override the default version string to return the server header as specified in the configuration.
+
+        If the server header is not set, then it returns the default version string of the HTTP server.
+
+        :return: ``Server`` version string, which is either the server header or the default version string
+            from the :class:`BaseHTTPRequestHandler`.
+        """
+        return self.server.server_header or super().version_string()
+
     def _write_status_code_only(self, status_code: int) -> None:
         """Write a response that is composed only of the HTTP status.
 
@@ -156,7 +166,6 @@ class RestApiHandler(BaseHTTPRequestHandler):
         :param headers: dictionary of additional HTTP headers to set for the response. Each key is the header name, and
             the corresponding value is the value for the header in the response.
         """
-        # TODO: try-catch ConnectionResetError: [Errno 104] Connection reset by peer and log it in DEBUG level
         self.send_response(status_code)
         headers = headers or {}
         if content_type:
@@ -218,6 +227,9 @@ class RestApiHandler(BaseHTTPRequestHandler):
             'scope': patroni.postgresql.scope,
             'name': patroni.postgresql.name
         }
+
+        if patroni.site:
+            response['site'] = patroni.site
         if patroni.scheduled_restart:
             response['scheduled_restart'] = patroni.scheduled_restart.copy()
             del response['scheduled_restart']['postmaster_start_time']
@@ -258,6 +270,8 @@ class RestApiHandler(BaseHTTPRequestHandler):
                     * ``lag``: only accept replication lag up to ``lag``. Accepts either an :class:`int`, which
                         represents lag in bytes, or a :class:`str` representing lag in human-readable format (e.g.
                         ``10MB``).
+                    * ``replication_state``: only return HTTP status ``200`` if the node's state matches the
+                        requested one (e.g. "streaming")
                     * Any custom parameter: will attempt to match them against node tags.
 
                 * HTTP status ``200``: if up and running as a standby and without ``noloadbalance`` tag.
@@ -323,8 +337,14 @@ class RestApiHandler(BaseHTTPRequestHandler):
             max_replica_lag = sys.maxsize
         is_lagging = leader_optime and leader_optime > replayed_location + max_replica_lag
 
+        wanted_replication_state = self.path_query.get('replication_state', [None])[0]
+        matches_replication_state = response.get('replication_state') == wanted_replication_state \
+            if wanted_replication_state else True
+
         replica_status_code = 200 if not patroni.noloadbalance and not is_lagging and \
-            response.get('role') == PostgresqlRole.REPLICA and response.get('state') == PostgresqlState.RUNNING else 503
+            response.get('role') == PostgresqlRole.REPLICA and \
+            response.get('state') == PostgresqlState.RUNNING and \
+            matches_replication_state else 503
 
         if not cluster and response.get('pause'):
             leader_status_code = 200 if response.get('role') in (PostgresqlRole.PRIMARY,
@@ -596,6 +616,10 @@ class RestApiHandler(BaseHTTPRequestHandler):
               ``15.2``;
             * ``patroni_cluster_unlocked``: ``1`` if no one holds the leader lock, else ``0``;
             * ``patroni_failsafe_mode_is_active``: ``1`` if ``failsafe_mode`` is currently active, else ``0``;
+            * ``patroni_failsafe_mode_enabled``: ``1`` if ``failsafe_mode`` is enabled in configuration, else ``0``;
+            * ``patroni_failsafe_member``: ``1`` if this node is a member of failsafe topology, else ``0``;
+            * ``patroni_failover_priority``: failover priority of this node (``0`` if ``nofailover`` is set, else value
+              of ``failover_priority`` tag, defaulting to ``1``);
             * ``patroni_postgres_timeline``: PostgreSQL timeline based on current WAL file name;
             * ``patroni_dcs_last_seen``: epoch timestamp when DCS was last contacted successfully;
             * ``patroni_pending_restart``: ``1`` if this PostgreSQL node is pending a restart, else ``0``;
@@ -694,7 +718,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
 
         metrics.append("# HELP patroni_postgres_server_version Version of Postgres (if running), 0 otherwise.")
         metrics.append("# TYPE patroni_postgres_server_version gauge")
-        metrics.append("patroni_postgres_server_version {0} {1}".format(labels, postgres.get('server_version', 0)))
+        metrics.append("patroni_postgres_server_version{0} {1}".format(labels, postgres.get('server_version', 0)))
 
         metrics.append("# HELP patroni_cluster_unlocked Value is 1 if the cluster is unlocked, 0 if locked.")
         metrics.append("# TYPE patroni_cluster_unlocked gauge")
@@ -705,8 +729,18 @@ class RestApiHandler(BaseHTTPRequestHandler):
         metrics.append("patroni_failsafe_mode_is_active{0} {1}"
                        .format(labels, int(postgres.get('failsafe_mode_is_active', 0))))
 
+        metrics.append("# HELP patroni_failsafe_mode_enabled Value is 1 if failsafe_mode is enabled, 0 otherwise.")
+        metrics.append("# TYPE patroni_failsafe_mode_enabled gauge")
+        metrics.append("patroni_failsafe_mode_enabled{0} {1}".format(labels, int(patroni.ha.is_failsafe_mode())))
+
+        failsafe = patroni.dcs.failsafe
+        is_failsafe_member = isinstance(failsafe, dict) and patroni.postgresql.name in failsafe
+        metrics.append("# HELP patroni_failsafe_member Value is 1 if this node is a member of failsafe, 0 otherwise.")
+        metrics.append("# TYPE patroni_failsafe_member gauge")
+        metrics.append("patroni_failsafe_member{0} {1}".format(labels, int(is_failsafe_member)))
+
         metrics.append("# HELP patroni_postgres_timeline Postgres timeline of this node (if running), 0 otherwise.")
-        metrics.append("# TYPE patroni_postgres_timeline counter")
+        metrics.append("# TYPE patroni_postgres_timeline gauge")
         metrics.append("patroni_postgres_timeline{0} {1}".format(labels, postgres.get('timeline') or 0))
 
         metrics.append("# HELP patroni_dcs_last_seen Epoch timestamp when DCS was last contacted successfully"
@@ -722,6 +756,19 @@ class RestApiHandler(BaseHTTPRequestHandler):
         metrics.append("# HELP patroni_is_paused Value is 1 if auto failover is disabled, 0 otherwise.")
         metrics.append("# TYPE patroni_is_paused gauge")
         metrics.append("patroni_is_paused{0} {1}".format(labels, int(postgres.get('pause', 0))))
+
+        metrics.append("# HELP patroni_postgres_state Numeric representation of Postgres state.")
+        # Generate description of all state values for metrics documentation
+        state_descriptions = [f"{state.index}={state.name.lower()}" for state in PostgresqlState]
+        metrics.append(f"# Values: {', '.join(state_descriptions)}")
+        metrics.append("# TYPE patroni_postgres_state gauge")
+        current_state = postgres['state']
+        state_value = current_state.index if isinstance(current_state, PostgresqlState) else -1
+        metrics.append(f"patroni_postgres_state{labels} {state_value}")
+
+        metrics.append("# HELP patroni_failover_priority Failover priority of this node.")
+        metrics.append("# TYPE patroni_failover_priority gauge")
+        metrics.append("patroni_failover_priority{0} {1}".format(labels, patroni.failover_priority))
 
         self.write_response(200, '\n'.join(metrics) + '\n', content_type='text/plain')
 
@@ -946,7 +993,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             # failed to parse the json
             return
         if request:
-            logger.debug("received restart request: {0}".format(request))
+            logger.debug("received restart request: %s", request)
 
         if global_config.from_cluster(cluster).is_paused and 'schedule' in request:
             self.write_response(status_code, "Can't schedule restart in the paused state")
@@ -1051,6 +1098,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
         The request body may contain a JSON dictionary with the following key:
 
             * ``force``: ``True`` if we want to cancel an already running task in order to reinit a replica.
+            * ``from_leader``: ``True`` if we want to reinit a replica and get basebackup from the leader node.
 
         Response HTTP status codes:
 
@@ -1063,8 +1111,9 @@ class RestApiHandler(BaseHTTPRequestHandler):
             logger.debug('received reinitialize request: %s', request)
 
         force = isinstance(request, dict) and parse_bool(request.get('force')) or False
+        from_leader = isinstance(request, dict) and parse_bool(request.get('from_leader')) or False
 
-        data = self.server.patroni.ha.reinitialize(force)
+        data = self.server.patroni.ha.reinitialize(force, from_leader)
         if data is None:
             status_code = 200
             data = 'reinitialize started'
@@ -1104,7 +1153,8 @@ class RestApiHandler(BaseHTTPRequestHandler):
                     return 503, action.title() + ' failed'
             except Exception as e:
                 logger.debug('Exception occurred during polling %s result: %s', action, e)
-        return 503, action.title() + ' status unknown'
+        return 503, '{0} status unknown after {1} seconds; operation may still be in progress'.format(
+            action.title(), timeout * 2)
 
     def is_failover_possible(self, cluster: Cluster, leader: Optional[str], candidate: Optional[str],
                              action: str) -> Optional[str]:
@@ -1449,14 +1499,11 @@ class RestApiHandler(BaseHTTPRequestHandler):
         logger.debug("API thread: %s - - %s latency: %0.3f ms", self.client_address[0], format % args, latency)
 
 
-class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
+class RestApiServer(ThreadingMixIn, HTTPServer):
     """Patroni REST API server.
 
-    An asynchronous thread-based HTTP server.
+    An asynchronous thread-pool-based HTTP server.
     """
-
-    # On 3.7+ the `ThreadingMixIn` gathers all non-daemon worker threads in order to join on them at server close.
-    daemon_threads = True  # Make worker threads "fire and forget" to prevent a memory leak.
 
     def __init__(self, patroni: Patroni, config: Dict[str, Any]) -> None:
         """Establish patroni configuration for the REST API daemon.
@@ -1474,11 +1521,45 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         self.patroni = patroni
         self.__listen = None
         self.request_queue_size = int(config.get('request_queue_size', 5))
+        try:
+            thread_pool_size = max(5, int(config.get('thread_pool_size', 5)))
+        except Exception as e:
+            logger.warning('Failed to parse restapi.thread_pool_size value "%s": %r', config.get('thread_pool_size'), e)
+            thread_pool_size = 5
+        logger.info('REST API thread_pool_size = %d', thread_pool_size)
+        self._executor = PatroniThreadPoolExecutor(max_workers=thread_pool_size + 1, thread_name_prefix='RestAPI')
         self.__ssl_options: Dict[str, Any] = {}
         self.__ssl_serial_number = None
         self._received_new_cert = False
         self.reload_config(config)
         self.daemon = True
+
+    def construct_server_tokens(self, token_config: str) -> str:
+        """Construct the value for the ``Server`` HTTP header based on *server_tokens*.
+
+        :param server_tokens: the value of ``restapi.server_tokens`` configuration option.
+
+        :returns: a string to be used as the value of ``Server`` HTTP header.
+        """
+        token = token_config.lower()
+        logger.debug('restapi.server_tokens is set to "%s".', token_config)
+
+        # If 'original' is set, we do not modify the Server header.
+        # This is useful for compatibility with existing setups that expect the original header.
+        if token == 'original':
+            return ""
+
+        # If 'productonly', or 'minimal' is set, we construct the header accordingly.
+        if token == 'productonly':  # Show only the product name, without versions.
+            return 'Patroni'
+        elif token == 'minimal':    # Show only the product name and version, without PostgreSQL version.
+            return f'Patroni/{self.patroni.version}'
+        else:
+            # Token is not valid (one of 'original', 'productonly', 'minimal') so report a warning and
+            # return an empty string.
+            logger.warning('restapi.server_tokens is set to "%s". Patroni will not modify the Server header. '
+                           'Valid values are: "Minimal", "ProductOnly".', token_config)
+            return ""
 
     def query(self, sql: str, *params: Any) -> List[Tuple[Any, ...]]:
         """Execute *sql* query with *params* and optionally return results.
@@ -1707,8 +1788,8 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
 
         reloading_config = self.__listen is not None  # changing config in runtime
         if reloading_config:
-            self.shutdown()
-            # Rely on ThreadingMixIn.server_close() to have all requests terminate before we continue
+            HTTPServer.shutdown(self)
+            # Rely on TCPServer.server_close() to have all requests terminate before we continue
             self.server_close()
 
         self.__listen = listen
@@ -1716,7 +1797,6 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         self._received_new_cert = False  # reset to False after reload_config()
 
         self.__httpserver_init(host, port)
-        Thread.__init__(self, target=self.serve_forever)
         self._set_fd_cloexec(self.socket)
 
         # wrap socket with ssl if 'certfile' is defined in a config.yaml
@@ -1741,6 +1821,9 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         if reloading_config:
             self.start()
 
+    def start(self) -> None:
+        self._executor.submit(self.serve_forever)
+
     def process_request_thread(self, request: Union[socket.socket, Tuple[bytes, socket.socket]],
                                client_address: Tuple[str, int]) -> None:
         """Process a request to the REST API.
@@ -1758,8 +1841,47 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         if hasattr(request, 'context'):  # SSLSocket
             from ssl import SSLSocket
             if isinstance(request, SSLSocket):  # pyright
-                request.do_handshake()
+                try:
+                    request.do_handshake()
+                except OSError as e:
+                    # The client may reset the connection (or otherwise fail the TLS handshake, e.g.
+                    # ssl.SSLError or a timeout -- all OSError subclasses) before we even start handling
+                    # the request. In that case the parent process_request_thread(), which is responsible
+                    # for closing the socket, is never reached, so we shut the request down ourselves and
+                    # log at DEBUG instead of leaking it.
+                    logger.debug('Connection from %s:%s was reset during the SSL handshake: %r',
+                                 client_address[0], client_address[1], e)
+                    self.shutdown_request(request)
+                    return
         super(RestApiServer, self).process_request_thread(request, client_address)
+
+    def process_request(self, request: Union[socket.socket, Tuple[bytes, socket.socket]],
+                        client_address: Tuple[str, int]) -> None:
+        self._executor.submit(self.process_request_thread, request, client_address)
+
+    def finish_request(self, request: Union[socket.socket, Tuple[bytes, socket.socket]],
+                       client_address: Tuple[str, int]) -> None:
+        """Finish one request by instantiating the request handler class.
+
+        Wrapper for :func:`~socketserver.BaseServer.finish_request` that intercepts :class:`OSError`
+        exceptions raised while handling the request. A client (typically a load-balancer performing
+        health-checks) may drop the connection before Patroni is done writing the response -- a
+        connection reset or broken pipe on a plain socket, or an :class:`ssl.SSLError` on a TLS one
+        (all :class:`OSError` subclasses). There is nothing we can do about it, and it is not worth
+        letting it propagate to :func:`handle_error`, which would pollute the log with a WARNING and a
+        stack trace, so we just log it at the DEBUG level.
+
+        :param request: socket to handle the client request.
+        :param client_address: tuple containing the client IP and port.
+        """
+        try:
+            super(RestApiServer, self).finish_request(request, client_address)
+        except OSError as e:
+            logger.debug('Connection from %s:%s was reset: %r', client_address[0], client_address[1], e)
+
+    def shutdown(self) -> None:
+        super(RestApiServer, self).shutdown()
+        self._executor.shutdown(wait=True)
 
     def shutdown_request(self, request: Union[socket.socket, Tuple[bytes, socket.socket]]) -> None:
         """Shut down a request to the REST API.
@@ -1857,6 +1979,9 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
         if TYPE_CHECKING:  # pragma: no cover
             assert isinstance(self.__listen, str)
         self.connection_string = uri(self.__protocol, config.get('connect_address') or self.__listen, 'patroni')
+
+        # Define the Server header response using the server_tokens option.
+        self.server_header = self.construct_server_tokens(config.get('server_tokens', 'original'))
 
     def handle_error(self, request: Union[socket.socket, Tuple[bytes, socket.socket]],
                      client_address: Tuple[str, int]) -> None:

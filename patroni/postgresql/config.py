@@ -8,7 +8,7 @@ import time
 
 from contextlib import contextmanager
 from types import TracebackType
-from typing import Any, Callable, Collection, Dict, Iterator, List, Optional, Tuple, Type, TYPE_CHECKING, Union
+from typing import Any, Callable, Collection, Dict, Generator, List, Optional, Tuple, Type, TYPE_CHECKING, Union
 from urllib.parse import parse_qsl, unquote, urlparse
 
 from .. import global_config
@@ -21,12 +21,21 @@ from ..utils import compare_values, get_postgres_version, is_subpath, \
     maybe_convert_from_base_unit, parse_bool, parse_int, split_host_port, uri, validate_directory
 from ..validator import EnumValidator, IntValidator
 from .misc import get_major_from_minor_version, postgres_version_to_int, PostgresqlRole, PostgresqlState
+from .sync import SYNC_STRICT_PLACEHOLDER
 from .validator import recovery_parameters, transform_postgresql_parameter_value, transform_recovery_parameter_value
 
 if TYPE_CHECKING:  # pragma: no cover
     from . import Postgresql
 
 logger = logging.getLogger(__name__)
+
+AUTH_ALLOWED_PARAMETERS_VERSIONS = {
+    'gssencmode': 120000,
+    'channel_binding': 130000,
+    'sslpassword': 130000,
+    'sslcrldir': 140000,
+    'sslnegotiation': 170000
+}
 
 PARAMETER_RE = re.compile(r'([a-z_]+)\s*=\s*')
 
@@ -449,11 +458,15 @@ class ConfigHandler(object):
 
     @property
     def pg_version(self) -> int:
-        """Current full postgres version if instance is running, major version otherwise.
+        """Return current postgres version.
 
-        We can only use ``postgres --version`` output if major version there equals to the one
-        in data directory. If it is not the case, we should use major version from the ``PG_VERSION``
-        file.
+        If instance is running, try to get version from the server. If it is not possible, get minor version
+        from the binary.
+        However, we can only use ``postgres --version`` output if major version there equals to the one in data
+        directory. If it is not the case, use major version from the ``PG_VERSION`` file.
+        If ``PG_VERSION`` file is missing, inaccessible, or contains invalid value, use minor version from the binary.
+
+        :returns: integer representation of the current postgres version.
         """
         if self._postgresql.state == PostgresqlState.RUNNING:
             try:
@@ -463,7 +476,7 @@ class ConfigHandler(object):
         bin_minor = postgres_version_to_int(get_postgres_version(bin_name=self._postgresql.pgcommand('postgres')))
         bin_major = get_major_from_minor_version(bin_minor)
         datadir_major = self._postgresql.major_version
-        return datadir_major if bin_major != datadir_major else bin_minor
+        return datadir_major if datadir_major and bin_major != datadir_major else bin_minor
 
     @property
     def _configuration_to_save(self) -> List[str]:
@@ -492,7 +505,7 @@ class ConfigHandler(object):
             os.chmod(filename, 0o666 & ~pg_perm.orig_umask)
 
     @contextmanager
-    def config_writer(self, filename: str) -> Iterator[ConfigWriter]:
+    def config_writer(self, filename: str) -> Generator[ConfigWriter, None, None]:
         """Create :class:`ConfigWriter` object and set permissions on a *filename*.
 
         :param filename: path to a config file.
@@ -629,11 +642,11 @@ class ConfigHandler(object):
         ret = member.conn_kwargs(self.replication)
         ret['application_name'] = self._postgresql.name
         ret.setdefault('sslmode', 'prefer')
-        if self._postgresql.major_version >= 120000:
+        if self._postgresql.major_version >= AUTH_ALLOWED_PARAMETERS_VERSIONS['gssencmode']:
             ret.setdefault('gssencmode', 'prefer')
-        if self._postgresql.major_version >= 130000:
+        if self._postgresql.major_version >= AUTH_ALLOWED_PARAMETERS_VERSIONS['channel_binding']:
             ret.setdefault('channel_binding', 'prefer')
-        if self._postgresql.major_version >= 170000:
+        if self._postgresql.major_version >= AUTH_ALLOWED_PARAMETERS_VERSIONS['sslnegotiation']:
             ret.setdefault('sslnegotiation', 'postgres')
         if self._krbsrvname:
             ret['krbsrvname'] = self._krbsrvname
@@ -660,8 +673,7 @@ class ConfigHandler(object):
         def escape(value: Any) -> str:
             return re.sub(r'([\'\\ ])', r'\\\1', str(value))
 
-        key_ver = {'target_session_attrs': 100000, 'gssencmode': 120000, 'channel_binding': 130000,
-                   'sslpassword': 130000, 'sslcrldir': 140000, 'sslnegotiation': 170000}
+        key_ver = {'target_session_attrs': 100000, **AUTH_ALLOWED_PARAMETERS_VERSIONS}
         return ' '.join('{0}={1}'.format(kw, escape(params[kw])) for kw in keywords
                         if params.get(kw) is not None and self._postgresql.major_version >= key_ver.get(kw, 0))
 
@@ -856,11 +868,11 @@ class ConfigHandler(object):
                     dbname = primary_conninfo.get('dbname')
                     if dbname:
                         wal_receiver_primary_conninfo['dbname'] = dbname
+                    # pg_stat_get_wal_receiver() returns masked password, therefore
+                    # we need to copy password value from primary_conninfo GUC.
+                    if 'password' in primary_conninfo:
+                        wal_receiver_primary_conninfo['password'] = primary_conninfo['password']
                     primary_conninfo = wal_receiver_primary_conninfo
-                    # There could be no password in the primary_conninfo or it is masked.
-                    # Just copy the "desired" value in order to make comparison succeed.
-                    if 'password' in wanted_primary_conninfo:
-                        primary_conninfo['password'] = wanted_primary_conninfo['password']
 
         if 'passfile' in primary_conninfo and 'password' not in primary_conninfo \
                 and 'password' in wanted_primary_conninfo:
@@ -1007,6 +1019,10 @@ class ConfigHandler(object):
 
             self._current_recovery_params = CaseInsensitiveDict({n: [v, restart_required(n), self._postgresql_conf]
                                                                  for n, v in recovery_params.items()})
+            self._current_recovery_params.setdefault('recovery_min_apply_delay', ['0', False, self._postgresql_conf])
+            self._current_recovery_params.update({param: ['', restart_required(param), self._postgresql_conf]
+                                                  for param in self._recovery_parameters_to_compare
+                                                  if param not in self._current_recovery_params})
         else:
             with self.config_writer(self._recovery_conf) as f:
                 self._write_recovery_params(f, recovery_params)
@@ -1063,7 +1079,7 @@ class ConfigHandler(object):
             if synchronous_standby_names is None:
                 if global_config.is_synchronous_mode_strict\
                         and self._postgresql.role in (PostgresqlRole.PRIMARY, PostgresqlRole.PROMOTED):
-                    parameters['synchronous_standby_names'] = '*'
+                    parameters['synchronous_standby_names'] = SYNC_STRICT_PLACEHOLDER
                 else:
                     parameters.pop('synchronous_standby_names', None)
             else:
@@ -1156,10 +1172,7 @@ class ConfigHandler(object):
         local_conn_kwargs = {
             **local_address,
             **self._superuser,
-            'dbname': self._postgresql.database,
-            'fallback_application_name': 'Patroni',
-            'connect_timeout': 3,
-            'options': '-c statement_timeout=2000'
+            'dbname': self._postgresql.database
         }
         # if the "username" parameter is present, it actually needs to be "user" for connecting to PostgreSQL
         if 'username' in local_conn_kwargs:
@@ -1199,7 +1212,8 @@ class ConfigHandler(object):
 
         conf_changed = hba_changed = ident_changed = local_connection_address_changed = False
         param_diff = CaseInsensitiveDict()
-        if self._postgresql.state == PostgresqlState.RUNNING:
+        if not self._postgresql.bootstrap.running_custom_bootstrap and \
+                self._postgresql.state == PostgresqlState.RUNNING:
             changes = CaseInsensitiveDict({p: v for p, v in server_parameters.items()
                                            if p not in params_skip_changes})
             changes.update({p: None for p in self._server_parameters.keys()
@@ -1271,6 +1285,9 @@ class ConfigHandler(object):
 
         proxy_addr = config.get('proxy_address')
         self._postgresql.proxy_url = uri('postgres', proxy_addr, self._postgresql.database) if proxy_addr else None
+
+        if self._postgresql.bootstrap.running_custom_bootstrap:
+            return logger.info('Skipping PostgreSQL configuration update while in custom bootstrap.')
 
         if conf_changed or sighup:
             self.write_postgresql_conf()

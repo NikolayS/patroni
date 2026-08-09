@@ -558,10 +558,11 @@ class CoreV1ApiProxy(object):
             func = func[:-4] + ('endpoints' if self._use_endpoints else 'config_map')
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            retriable_http_codes = self._retriable_http_codes | set(kwargs.pop('_retriable_http_codes', None) or [])
             try:
                 return getattr(self._core_v1_api, func)(*args, **kwargs)
             except k8s_client.rest.ApiException as e:
-                if e.status in self._retriable_http_codes or e.headers and 'retry-after' in e.headers:
+                if e.status in retriable_http_codes or e.headers and 'retry-after' in e.headers:
                     raise KubernetesRetriableException(e)
                 raise
         return wrapper
@@ -1187,17 +1188,18 @@ class Kubernetes(AbstractDCS):
                                   resource_version: Optional[str], ips: List[str]) -> bool:
         retry = self._retry.copy()
 
-        def _retry(*args: Any, **kwargs: Any) -> Any:
-            kwargs['_retry'] = retry
+        def _retry_403(*args: Any, **kwargs: Any) -> Any:
+            kwargs.update(_retry=retry, _retriable_http_codes=frozenset([403]))
             return retry(*args, **kwargs)
 
         try:
-            return bool(self._patch_or_create(self.leader_path, annotations, resource_version, ips=ips, retry=_retry))
+            return bool(self._patch_or_create(self.leader_path, annotations, resource_version,
+                                              ips=ips, retry=_retry_403))
         except k8s_client.rest.ApiException as e:
             if e.status == 409:
                 logger.warning('Concurrent update of %s', self.leader_path)
             else:
-                logger.exception('Permission denied' if e.status == 403 else 'Unexpected error from Kubernetes API')
+                logger.exception('Unexpected error from Kubernetes API')
                 return False
         except (RetryFailedError, K8sException) as e:
             raise KubernetesError(e)
@@ -1205,6 +1207,10 @@ class Kubernetes(AbstractDCS):
         # if we are here, that means update failed with 409
         if not retry.ensure_deadline(1):
             return False  # No time for retry. Tell ha.py that we have to demote due to failed update.
+
+        def _retry(*args: Any, **kwargs: Any) -> Any:
+            kwargs['_retry'] = retry
+            return retry(*args, **kwargs)
 
         # Try to get the latest version directly from K8s API instead of relying on async cache
         try:
@@ -1251,7 +1257,8 @@ class Kubernetes(AbstractDCS):
         leader_observed_record = kind_annotations or self._leader_observed_record
         annotations = {self._LEADER: self._name, 'ttl': str(self._ttl), 'renewTime': now,
                        'acquireTime': leader_observed_record.get('acquireTime') or now,
-                       'transitions': leader_observed_record.get('transitions') or '0'}
+                       'transitions': leader_observed_record.get('transitions') or '0',
+                       'current_site': self.site}
         if last_lsn:
             annotations[self._OPTIME] = str(last_lsn)
             annotations['slots'] = json.dumps(slots, separators=(',', ':')) if slots else None
