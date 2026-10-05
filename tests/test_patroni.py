@@ -102,6 +102,11 @@ class TestPatroni(unittest.TestCase):
     def tearDown(self):
         logging.getLogger().handlers[:] = self._handlers
 
+    def test_fence(self):
+        with patch.object(Postgresql, 'fence') as mock_fence:
+            self.p._fence()
+        mock_fence.assert_called_once_with()
+
     def test_apply_dynamic_configuration(self):
         empty_cluster = Cluster.empty()
         self.p.config._dynamic_configuration = {}

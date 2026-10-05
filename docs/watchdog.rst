@@ -19,7 +19,14 @@ By default Patroni will set up the watchdog to expire 5 seconds before TTL expir
 
 Safety margin is the amount of time that Patroni reserves for time between leader key update and watchdog keepalive. Patroni will try to send a keepalive immediately after confirmation of leader key update. If Patroni process is suspended for extended amount of time at exactly the right moment the keepalive may be delayed for more than the safety margin without triggering the watchdog. This results in a window of time where watchdog will not trigger before leader key expiration, invalidating the guarantee. To be absolutely sure that watchdog will trigger under all circumstances set up the watchdog to expire after half of TTL by setting ``safety_margin`` to -1 to set watchdog timeout to ``ttl // 2``. If you need this guarantee you probably should increase ``ttl`` and/or reduce ``loop_wait`` and ``retry_timeout``.
 
-Currently watchdogs are only supported using Linux watchdog device interface.
+Currently watchdogs are only supported using Linux watchdog device interface, and a userspace fallback described below.
+
+Userspace fallback
+------------------
+
+Set ``watchdog.driver: software`` to use a watchdog thread inside Patroni instead of a kernel device. When the HA loop does not send a keepalive in time, the thread kills PostgreSQL (the postmaster and all its children) with ``SIGKILL``. Nothing in this path reads or writes the disk, so it still works when a disk stall blocks the HA loop in the kernel.
+
+This is weaker than a kernel watchdog. It can not reset the host, and it does not help when the whole Patroni process is frozen or killed. Use it only where ``/dev/watchdog`` is not available.
 
 Setting up software watchdog on Linux
 -------------------------------------

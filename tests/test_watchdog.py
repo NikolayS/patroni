@@ -10,6 +10,7 @@ import patroni.watchdog.linux as linuxwd
 from patroni.watchdog import Watchdog, WatchdogError
 from patroni.watchdog.base import NullWatchdog
 from patroni.watchdog.linux import LinuxWatchdogDevice
+from patroni.watchdog.software import SoftwareWatchdog
 
 
 class MockDevice:
@@ -232,3 +233,43 @@ class TestLinuxWatchdogDevice(unittest.TestCase):
     @patch('os.open', Mock(side_effect=OSError))
     def test_open(self):
         self.assertRaises(WatchdogError, self.impl.open)
+
+
+class TestSoftwareWatchdog(unittest.TestCase):
+
+    def test_fences_when_keepalive_is_late(self):
+        fence = Mock()
+        watchdog = SoftwareWatchdog(fence)
+        watchdog.poll_interval = 0.01
+        watchdog.set_timeout(0)
+        watchdog.open()
+        self.assertTrue(watchdog.is_running)
+        watchdog._thread.join(5)
+        fence.assert_called_once_with()
+        self.assertFalse(watchdog.is_running)
+
+    def test_keepalive_delays_the_fence(self):
+        fence = Mock()
+        watchdog = SoftwareWatchdog(fence)
+        watchdog.poll_interval = 0.01
+        watchdog.set_timeout(1000)
+        watchdog.open()
+        watchdog.keepalive()
+        watchdog.close()
+        watchdog._thread.join(5)
+        fence.assert_not_called()
+        self.assertFalse(watchdog.is_running)
+        self.assertTrue(watchdog.is_healthy)
+        self.assertTrue(watchdog.has_set_timeout())
+        self.assertEqual(watchdog.get_timeout(), 1000)
+
+    def test_facade_uses_software_driver(self):
+        config = {'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required', 'driver': 'software'}}
+        # The driver needs a fence function. Without it, there is no watchdog.
+        self.assertRaises(SystemExit, Watchdog, config)
+        watchdog = Watchdog(config, Mock())
+        self.assertTrue(watchdog.activate())
+        self.assertTrue(watchdog.is_running)
+        self.assertEqual(watchdog.impl.get_timeout(), 25)
+        watchdog.disable()
+        self.assertFalse(watchdog.is_running)

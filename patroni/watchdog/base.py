@@ -60,10 +60,17 @@ class WatchdogConfig(object):
     def __ne__(self, other: Any) -> bool:
         return not self == other
 
-    def get_impl(self) -> 'WatchdogBase':
+    def get_impl(self, fence: Optional[Callable[[], None]] = None) -> 'WatchdogBase':
+        """Create the watchdog implementation for the configured driver.
+
+        :param fence: function for the ``software`` driver to call when a keepalive is late.
+        """
         if self.driver == 'testing':  # pragma: no cover
             from patroni.watchdog.linux import TestingWatchdogDevice
             return TestingWatchdogDevice.from_config(self.driver_config)
+        elif self.driver == 'software' and fence is not None:
+            from patroni.watchdog.software import SoftwareWatchdog
+            return SoftwareWatchdog(fence)
         elif platform.system() == 'Linux' and self.driver == 'default':
             from patroni.watchdog.linux import LinuxWatchdogDevice
             return LinuxWatchdogDevice.from_config(self.driver_config)
@@ -87,16 +94,22 @@ class Watchdog(object):
 
     When activation fails underlying implementation will be switched to a Null implementation. To avoid log spam
     activation will only be retried when watchdog configuration is changed."""
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, fence: Optional[Callable[[], None]] = None) -> None:
+        """Create the facade.
+
+        :param config: Patroni configuration.
+        :param fence: function for the ``software`` driver to call when a keepalive is late.
+        """
         self.config = WatchdogConfig(config)
         self.active_config: WatchdogConfig = self.config
         self.lock = RLock()
         self.active = False
+        self._fence = fence
 
         if self.config.mode == MODE_OFF:
             self.impl = NullWatchdog()
         else:
-            self.impl = self.config.get_impl()
+            self.impl = self.config.get_impl(fence)
             if self.config.mode == MODE_REQUIRED and self.impl.is_null:
                 logger.error("Configuration requires a watchdog, but watchdog is not supported on this platform.")
                 sys.exit(1)
@@ -115,7 +128,7 @@ class Watchdog(object):
         if not self.active:
             if self.config.driver != self.active_config.driver or \
                self.config.driver_config != self.active_config.driver_config:
-                self.impl = self.config.get_impl()
+                self.impl = self.config.get_impl(self._fence)
             self.active_config = self.config
 
     @synchronized
@@ -212,12 +225,12 @@ class Watchdog(object):
             # In case there are any pending configuration changes apply them now.
             if self.active and self.config != self.active_config:
                 if self.config.mode != MODE_OFF and self.active_config.mode == MODE_OFF:
-                    self.impl = self.config.get_impl()
+                    self.impl = self.config.get_impl(self._fence)
                     self._activate()
                 if self.config.driver != self.active_config.driver \
                    or self.config.driver_config != self.active_config.driver_config:
                     self._disable()
-                    self.impl = self.config.get_impl()
+                    self.impl = self.config.get_impl(self._fence)
                     self._activate()
                 if self.config.timeout != self.active_config.timeout:
                     self.impl.set_timeout(self.config.timeout)

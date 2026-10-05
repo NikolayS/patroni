@@ -441,6 +441,7 @@ Watchdog
 --------
 -  **mode**: ``off``, ``automatic`` or ``required``. When ``off`` watchdog is disabled. When ``automatic`` watchdog will be used if available, but ignored if it is not. When ``required`` the node will not become a leader unless watchdog can be successfully enabled.
 -  **device**: Path to watchdog device. Defaults to ``/dev/watchdog``.
+-  **driver**: ``default`` uses the Linux watchdog device. ``software`` uses a thread inside Patroni that kills PostgreSQL when the HA loop is late. See :ref:`watchdog`.
 -  **safety_margin**: Number of seconds of safety margin between watchdog triggering and leader key expiration.
 
 .. _tags_settings:

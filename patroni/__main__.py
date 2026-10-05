@@ -81,7 +81,7 @@ class Patroni(AbstractPatroniDaemon, ClusterSite, Tags):
         cluster = self.ensure_dcs_access()
         self.ensure_unique_name(cluster)
 
-        self.watchdog = Watchdog(self.config)
+        self.watchdog = Watchdog(self.config, self._fence)
         self.apply_dynamic_configuration(cluster)
 
         # Initialize global config
@@ -155,6 +155,10 @@ class Patroni(AbstractPatroniDaemon, ClusterSite, Tags):
             sys.exit(1)
         except Exception:
             self.logger.update_loggers(configured_loggers)
+
+    def _fence(self) -> None:
+        """Kill PostgreSQL. The software watchdog calls this when the HA loop is late."""
+        self.postgresql.fence()
 
     def _get_tags(self) -> Dict[str, Any]:
         """Get tags configured for this node, if any.
