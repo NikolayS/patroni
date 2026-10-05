@@ -24,7 +24,7 @@ Currently watchdogs are only supported using Linux watchdog device interface, an
 Userspace fallback
 ------------------
 
-Set ``watchdog.driver: software`` to use a watchdog thread inside Patroni instead of a kernel device. When the HA loop does not send a keepalive in time, the thread kills PostgreSQL (the postmaster and all its children) with ``SIGKILL``. It uses the postmaster process that Patroni already knows; it does not read the data directory, and its log messages go through the Patroni log queue. So it still works when a disk stall blocks the HA loop in the kernel. The ``device`` option is ignored with this driver.
+In ``automatic`` mode, when ``/dev/watchdog`` can not be opened, Patroni falls back to this watchdog thread and logs a warning. Set ``watchdog.driver: software`` to use the thread instead of a kernel device from the start. When the HA loop does not send a keepalive in time, the thread kills PostgreSQL (the postmaster and all its children) with ``SIGKILL``. It uses the postmaster process that Patroni already knows; it does not read the data directory, and its log messages go through the Patroni log queue. So it still works when a disk stall blocks the HA loop in the kernel. The ``device`` option is ignored with this driver.
 
 This is weaker than a kernel watchdog. It can not reset the host, and it does not help when the whole Patroni process is frozen or killed. Use it only where ``/dev/watchdog`` is not available.
 

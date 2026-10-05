@@ -95,6 +95,29 @@ class TestWatchdog(unittest.TestCase):
         self.assertFalse(Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}}).activate())
 
     @patch('platform.system', Mock(return_value='Linux'))
+    @patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device')))
+    def test_software_fallback_when_device_can_not_be_opened(self):
+        config = {'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}
+        # With a fence function the software watchdog takes over.
+        watchdog = Watchdog(config, Mock())
+        with self.assertLogs('patroni.watchdog.base', level='WARNING') as logs:
+            self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
+        self.assertTrue(watchdog.is_running)
+        self.assertEqual(watchdog.impl.get_timeout(), 25)
+        self.assertIn('software watchdog', logs.output[0])
+        watchdog.disable()
+        self.assertFalse(watchdog.is_running)
+        # Without a fence function there is nothing to fall back to.
+        watchdog = Watchdog(config)
+        self.assertTrue(watchdog.activate())
+        self.assertTrue(watchdog.impl.is_null)
+        # Required mode does not fall back: the operator asked for a real device.
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}}, Mock())
+        self.assertFalse(watchdog.activate())
+        self.assertTrue(watchdog.impl.is_null)
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'is_running', PropertyMock(return_value=False))
     def test_watchdog_activate(self):
         with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError(''))):

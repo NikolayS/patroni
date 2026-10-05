@@ -155,8 +155,8 @@ class Watchdog(object):
         except WatchdogError as e:
             log = logger.warning if self.config.mode == MODE_REQUIRED else logger.debug
             log("Could not activate %s: %s", self.impl.describe(), e)
-            self.impl = NullWatchdog()
-            actual_timeout = self.impl.get_timeout()
+            self.impl = self._software_fallback() if self.config.mode == MODE_AUTOMATIC else NullWatchdog()
+            actual_timeout = self._set_timeout()
 
         if self.impl.is_running and not self.impl.can_be_disabled:
             logger.warning("Watchdog implementation can't be disabled."
@@ -184,6 +184,21 @@ class Watchdog(object):
                 return False
 
         return True
+
+    def _software_fallback(self) -> 'WatchdogBase':
+        """Open a software watchdog in place of a device that could not be opened.
+
+        :returns: the opened software watchdog, or the null watchdog if there is no fence function.
+        """
+        if self._fence is None:
+            return NullWatchdog()
+        from patroni.watchdog.software import SoftwareWatchdog
+        impl = SoftwareWatchdog(self._fence)
+        impl.open()
+        logger.warning("Falling back to the software watchdog. It kills PostgreSQL when the HA loop hangs, "
+                       "but it can not reset the host. Load the softdog module for a kernel watchdog, "
+                       "or set watchdog.mode to off.")
+        return impl
 
     def _set_timeout(self) -> Optional[int]:
         if self.impl.has_set_timeout():
