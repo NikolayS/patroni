@@ -105,7 +105,7 @@ class TestWatchdog(unittest.TestCase):
         self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
         self.assertTrue(watchdog.is_running)
         self.assertEqual(watchdog.impl.get_timeout(), 25)
-        self.assertIn('software watchdog', logs.output[0])
+        self.assertIn('userspace watchdog', logs.output[0])
         watchdog.disable()
         self.assertFalse(watchdog.is_running)
         # Without a fence function there is nothing to fall back to.
@@ -116,6 +116,30 @@ class TestWatchdog(unittest.TestCase):
         watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}}, Mock())
         self.assertFalse(watchdog.activate())
         self.assertTrue(watchdog.impl.is_null)
+
+    @patch('platform.system', Mock(return_value='Linux'))
+    def test_fallback_retries_the_device_on_next_activation(self):
+        fence = Mock()
+        no_device = patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device')))
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}, fence)
+        with no_device:
+            self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
+        self.assertIs(watchdog.impl._fence, fence)
+        watchdog.disable()
+        # softdog was loaded in the meantime: the device is used again.
+        self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, LinuxWatchdogDevice)
+        self.assertTrue(watchdog.is_running)
+        watchdog.disable()
+        with no_device:
+            self.assertTrue(watchdog.activate())
+            self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
+            watchdog.disable()
+            # The operator switched to required mode: the fallback is not enough.
+            watchdog.reload_config({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}})
+            self.assertFalse(watchdog.activate())
+            self.assertTrue(watchdog.impl.is_null)
 
     @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'is_running', PropertyMock(return_value=False))
@@ -272,19 +296,24 @@ class TestSoftwareWatchdog(unittest.TestCase):
         self.assertFalse(watchdog.is_running)
 
     def test_keepalive_delays_the_fence(self):
+        clock = [0.0]
         fence = Mock()
-        watchdog = SoftwareWatchdog(fence)
-        watchdog.set_timeout(1)
-        watchdog.open()
-        self.assertTrue(watchdog.is_running)
-        # Keep it alive for longer than the timeout.
-        for _ in range(15):
-            watchdog.keepalive()
-            time.sleep(0.1)
-        fence.assert_not_called()
-        self.assertTrue(watchdog.is_running)
-        # Stop the keepalives. The fence must follow.
-        watchdog._thread.join(5)
+        with patch('patroni.watchdog.software.time.monotonic', side_effect=lambda: clock[0]):
+            watchdog = SoftwareWatchdog(fence)
+            watchdog.poll_interval = 0.01
+            watchdog.set_timeout(10)
+            watchdog.open()
+            self.assertTrue(watchdog.is_running)
+            # Keep it alive for much longer than the timeout.
+            for _ in range(5):
+                clock[0] += 8
+                watchdog.keepalive()
+                time.sleep(0.05)
+            fence.assert_not_called()
+            self.assertTrue(watchdog.is_running)
+            # Stop the keepalives and let the deadline pass. The fence must follow.
+            clock[0] += 11
+            watchdog._thread.join(5)
         fence.assert_called_once_with()
         self.assertFalse(watchdog.is_running)
 
@@ -299,7 +328,13 @@ class TestSoftwareWatchdog(unittest.TestCase):
         watchdog.open()  # a second open() does not start a second thread
         self.assertIs(watchdog._thread, thread)
         watchdog.close()
+        # open() right after close(): the old thread exits, the new one runs.
+        watchdog.open()
         thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(watchdog.is_running)
+        watchdog.close()
+        watchdog._thread.join(5)
         self.assertFalse(watchdog.is_running)
 
     def test_is_running_while_fence_runs_and_fence_failure_is_logged(self):

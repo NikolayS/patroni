@@ -63,7 +63,10 @@ class WatchdogConfig(object):
     def get_impl(self, fence: Optional[Callable[[], None]] = None) -> 'WatchdogBase':
         """Create the watchdog implementation for the configured driver.
 
-        :param fence: function for the ``software`` driver to call when a keepalive is late.
+        :param fence: function for the ``software`` driver to call when a keepalive is late. Without it the
+                      ``software`` driver is not available and the null watchdog is returned.
+
+        :returns: the watchdog implementation for the configured driver.
         """
         if self.driver == 'testing':  # pragma: no cover
             from patroni.watchdog.linux import TestingWatchdogDevice
@@ -92,8 +95,9 @@ class WatchdogConfig(object):
 class Watchdog(object):
     """Facade to dynamically manage watchdog implementations and handle config changes.
 
-    When activation fails underlying implementation will be switched to a Null implementation. To avoid log spam
-    activation will only be retried when watchdog configuration is changed."""
+    When activation fails the implementation is switched to the userspace watchdog in ``automatic`` mode (if a fence
+    function was given), otherwise to a Null implementation. To avoid log spam, a device that failed is retried only
+    on the next activation or when watchdog configuration is changed."""
     def __init__(self, config: Config, fence: Optional[Callable[[], None]] = None) -> None:
         """Create the facade.
 
@@ -105,6 +109,7 @@ class Watchdog(object):
         self.lock = RLock()
         self.active = False
         self._fence = fence
+        self._fallback = False
 
         if self.config.mode == MODE_OFF:
             self.impl = NullWatchdog()
@@ -144,6 +149,13 @@ class Watchdog(object):
     def _activate(self) -> bool:
         self.active_config = self.config
 
+        if self._fallback:
+            # Try the device again. The operator may have loaded softdog,
+            # or switched the mode to required since the last activation.
+            self._disable()
+            self.impl = self.config.get_impl(self._fence)
+            self._fallback = False
+
         if self.config.timing_slack < 0:
             logger.warning('Watchdog not supported because leader TTL %s is less than 2x loop_wait %s',
                            self.config.ttl, self.config.loop_wait)
@@ -155,6 +167,9 @@ class Watchdog(object):
         except WatchdogError as e:
             log = logger.warning if self.config.mode == MODE_REQUIRED else logger.debug
             log("Could not activate %s: %s", self.impl.describe(), e)
+            if self.impl.is_running:
+                # Do not leave an armed device behind without keepalives.
+                self._disable()
             self.impl = self._software_fallback() if self.config.mode == MODE_AUTOMATIC else NullWatchdog()
             actual_timeout = self._set_timeout()
 
@@ -186,16 +201,17 @@ class Watchdog(object):
         return True
 
     def _software_fallback(self) -> 'WatchdogBase':
-        """Open a software watchdog in place of a device that could not be opened.
+        """Open a userspace watchdog in place of a device that could not be activated.
 
-        :returns: the opened software watchdog, or the null watchdog if there is no fence function.
+        :returns: the opened userspace watchdog, or the null watchdog if there is no fence function.
         """
         if self._fence is None:
             return NullWatchdog()
         from patroni.watchdog.software import SoftwareWatchdog
         impl = SoftwareWatchdog(self._fence)
         impl.open()
-        logger.warning("Falling back to the software watchdog. It kills PostgreSQL when the HA loop hangs, "
+        self._fallback = True
+        logger.warning("Falling back to the userspace watchdog. It kills PostgreSQL when the HA loop hangs, "
                        "but it can not reset the host. Load the softdog module for a kernel watchdog, "
                        "or set watchdog.mode to off.")
         return impl

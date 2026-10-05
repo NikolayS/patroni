@@ -439,9 +439,9 @@ CTL
 
 Watchdog
 --------
--  **mode**: ``off``, ``automatic`` or ``required``. When ``off`` watchdog is disabled. When ``automatic`` the kernel watchdog device will be used if available. If it can not be opened, Patroni falls back to the ``software`` driver (see :ref:`watchdog`). When ``required`` the node will not become a leader unless watchdog can be successfully enabled.
+-  **mode**: ``off``, ``automatic`` or ``required``. When ``off`` watchdog is disabled. When ``automatic`` the kernel watchdog device will be used if available. If it can not be activated on Linux, Patroni falls back to the ``software`` driver (see :ref:`watchdog`). When ``required`` the node will not become a leader unless watchdog can be successfully enabled.
 -  **device**: Path to watchdog device. Defaults to ``/dev/watchdog``.
--  **driver**: ``default`` uses the Linux watchdog device. ``software`` uses a thread inside Patroni that kills PostgreSQL when the HA loop is late; ``device`` is ignored. Defaults to ``default``. See :ref:`watchdog`.
+-  **driver**: ``default`` uses the Linux watchdog device. ``software`` uses a thread inside Patroni that kills PostgreSQL when the HA loop is late; ``device`` is ignored and it works on every platform. Defaults to ``default``. See :ref:`watchdog`.
 -  **safety_margin**: Number of seconds of safety margin between watchdog triggering and leader key expiration.
 
 .. _tags_settings:

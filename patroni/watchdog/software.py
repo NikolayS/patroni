@@ -1,4 +1,4 @@
-"""Watchdog in userspace.
+"""Userspace watchdog (``watchdog.driver: software``).
 
 A fallback for hosts without a kernel watchdog device. A thread waits for
 keepalive calls. When a keepalive is late, the thread calls the fence
@@ -25,7 +25,8 @@ class SoftwareWatchdog(WatchdogBase):
     process. It does not help when the whole process is frozen. Use a
     kernel watchdog device when you can.
 
-    :ivar poll_interval: seconds between deadline checks.
+    The timeout is 60 seconds until :meth:`set_timeout` is called.
+    :attr:`poll_interval` is the longest sleep between deadline checks.
     """
 
     poll_interval = 1.0
