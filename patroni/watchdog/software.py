@@ -50,6 +50,7 @@ class SoftwareWatchdog(WatchdogBase):
         return True
 
     def open(self) -> None:
+        """Start the watchdog thread. Do nothing if it already runs."""
         if self.is_running:
             return
         # Each thread gets its own stop event. close() does not join
@@ -60,6 +61,7 @@ class SoftwareWatchdog(WatchdogBase):
         self._thread.start()
 
     def close(self) -> None:
+        """Tell the watchdog thread to stop. Do not wait for it."""
         self._stop.set()
 
     def keepalive(self) -> None:
@@ -76,9 +78,20 @@ class SoftwareWatchdog(WatchdogBase):
         self.keepalive()
 
     def _run(self, stop: Event) -> None:
-        while not stop.wait(self.poll_interval):
+        """Wait for the deadline. Call the fence function when it passes.
+
+        :param stop: event that ends the thread.
+        """
+        # Sleep until the deadline, but at most poll_interval. A keepalive
+        # can move the deadline while we sleep.
+        while not stop.wait(max(0.0, min(self.poll_interval, self._deadline - time.monotonic()))):
             if time.monotonic() > self._deadline:
                 logger.error('No watchdog keepalive for %s seconds. Fencing this node.', self._timeout)
+                # The thread stays "running" while the fence runs. The
+                # facade must not start a second thread in the meantime.
+                try:
+                    self._fence()
+                except Exception:
+                    logger.exception('Fence function failed')
                 stop.set()
-                self._fence()
                 return

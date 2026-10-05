@@ -1,6 +1,8 @@
 import ctypes
 import os
 import sys
+import threading
+import time
 import unittest
 
 from unittest.mock import Mock, patch, PropertyMock
@@ -240,10 +242,8 @@ class TestSoftwareWatchdog(unittest.TestCase):
     def test_fences_when_keepalive_is_late(self):
         fence = Mock()
         watchdog = SoftwareWatchdog(fence)
-        watchdog.poll_interval = 0.01
         watchdog.set_timeout(0)
         watchdog.open()
-        self.assertTrue(watchdog.is_running)
         watchdog._thread.join(5)
         fence.assert_called_once_with()
         self.assertFalse(watchdog.is_running)
@@ -251,17 +251,52 @@ class TestSoftwareWatchdog(unittest.TestCase):
     def test_keepalive_delays_the_fence(self):
         fence = Mock()
         watchdog = SoftwareWatchdog(fence)
-        watchdog.poll_interval = 0.01
-        watchdog.set_timeout(1000)
+        watchdog.set_timeout(1)
         watchdog.open()
-        watchdog.keepalive()
-        watchdog.close()
-        watchdog._thread.join(5)
+        self.assertTrue(watchdog.is_running)
+        # Keep it alive for longer than the timeout.
+        for _ in range(15):
+            watchdog.keepalive()
+            time.sleep(0.1)
         fence.assert_not_called()
+        self.assertTrue(watchdog.is_running)
+        # Stop the keepalives. The fence must follow.
+        watchdog._thread.join(5)
+        fence.assert_called_once_with()
         self.assertFalse(watchdog.is_running)
-        self.assertTrue(watchdog.is_healthy)
+
+    def test_close_stops_the_thread(self):
+        watchdog = SoftwareWatchdog(Mock())
+        watchdog.set_timeout(1000)
         self.assertTrue(watchdog.has_set_timeout())
         self.assertEqual(watchdog.get_timeout(), 1000)
+        self.assertTrue(watchdog.is_healthy)
+        watchdog.open()
+        thread = watchdog._thread
+        watchdog.open()  # a second open() does not start a second thread
+        self.assertIs(watchdog._thread, thread)
+        watchdog.close()
+        thread.join(5)
+        self.assertFalse(watchdog.is_running)
+
+    def test_is_running_while_fence_runs_and_fence_failure_is_logged(self):
+        started, finish = threading.Event(), threading.Event()
+
+        def fence():
+            started.set()
+            finish.wait(5)
+            raise RuntimeError('boom')
+
+        watchdog = SoftwareWatchdog(fence)
+        watchdog.set_timeout(0)
+        watchdog.open()
+        self.assertTrue(started.wait(5))
+        self.assertTrue(watchdog.is_running)  # the facade must not open a second thread now
+        with self.assertLogs('patroni.watchdog.software', level='ERROR') as logs:
+            finish.set()
+            watchdog._thread.join(5)
+        self.assertFalse(watchdog.is_running)
+        self.assertIn('Fence function failed', logs.output[-1])
 
     def test_facade_uses_software_driver(self):
         config = {'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required', 'driver': 'software'}}

@@ -988,6 +988,15 @@ class EnumValidator(object):
         return ret
 
 
+def validate_watchdog_driver(value: Any) -> None:
+    """Validate ``watchdog.driver`` configuration option.
+
+    :param value: value of ``watchdog.driver`` to be validated.
+    """
+    assert_(isinstance(value, str), "expected type is not a string")
+    assert_(value in ("default", "software", "testing"))
+
+
 def validate_watchdog_mode(value: Any) -> None:
     """Validate ``watchdog.mode`` configuration option.
 
@@ -1312,6 +1321,7 @@ schema = Schema({
     Optional("watchdog"): {
         Optional("mode"): validate_watchdog_mode,
         Optional("device"): str,
+        Optional("driver"): validate_watchdog_driver,
         Optional("safety_margin"): IntValidator(min=-1, expected_type=int, raise_assert=True),
     },
     Optional("tags"): {
