@@ -297,7 +297,9 @@ class Watchdog(object):
     def is_healthy(self) -> bool:
         if self.config.mode != MODE_REQUIRED:
             return True
-        return self.config.timing_slack >= 0 and self.impl.is_healthy
+        # After a failure the implementation is a placeholder. Ask the device that the next activation will try.
+        impl = self.config.get_impl(self._fence) if self._rebuild else self.impl
+        return self.config.timing_slack >= 0 and impl.is_healthy
 
 
 class WatchdogBase(abc.ABC):

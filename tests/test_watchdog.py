@@ -188,7 +188,10 @@ class TestWatchdog(unittest.TestCase):
         with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device'))):
             self.assertFalse(watchdog.activate())
         self.assertTrue(watchdog.impl.is_null)
-        # softdog was loaded in the meantime: the next leader attempt must succeed.
+        # softdog was loaded in the meantime. The node must become eligible again
+        # (the HA loop checks is_healthy before any leader attempt) and the attempt must succeed.
+        with patch.object(LinuxWatchdogDevice, 'is_healthy', PropertyMock(return_value=True)):
+            self.assertTrue(watchdog.is_healthy)
         self.assertTrue(watchdog.activate())
         self.assertIsInstance(watchdog.impl, LinuxWatchdogDevice)
         watchdog.disable()
