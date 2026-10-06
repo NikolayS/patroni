@@ -155,6 +155,21 @@ class TestWatchdog(unittest.TestCase):
         self.assertTrue(watchdog.impl.is_null)
 
     @patch('platform.system', Mock(return_value='Linux'))
+    def test_mode_off_then_on_rebuilds_the_watchdog(self):
+        config = {'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}
+        watchdog = Watchdog(config, Mock())
+        with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device'))):
+            self.assertTrue(watchdog.activate())
+        watchdog.disable()
+        watchdog.reload_config({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'off'}})
+        watchdog.reload_config(config)
+        # Back on while inactive: the next activation must use the device, not the leftover null watchdog.
+        self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, LinuxWatchdogDevice)
+        self.assertTrue(watchdog.is_running)
+        watchdog.disable()
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'get_support', Mock(side_effect=WatchdogError('no ioctl')))
     def test_device_closed_when_capability_query_fails(self):
         # get_support() fails in _set_timeout() and again in _disable(). The device must still be closed.

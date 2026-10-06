@@ -133,7 +133,9 @@ class Watchdog(object):
         # delay until next time a keepalive is sent so timeout matches up with leader key update.
         if not self.active:
             if self.config.driver != self.active_config.driver or \
-               self.config.driver_config != self.active_config.driver_config:
+               self.config.driver_config != self.active_config.driver_config or \
+               (self.active_config.mode == MODE_OFF and self.config.mode != MODE_OFF):
+                # Rebuild also when the mode goes from off to on. Off installed the null watchdog.
                 self.impl = self.config.get_impl(self._fence)
             self.active_config = self.config
 
