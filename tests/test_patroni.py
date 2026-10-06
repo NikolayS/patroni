@@ -335,6 +335,27 @@ class TestPatroni(unittest.TestCase):
 
     @patch('patroni.config.Config.save_cache', Mock())
     @patch('patroni.config.Config.set_dynamic_configuration', Mock(return_value=False))
+    @patch.object(Postgresql, 'reload_config', Mock(side_effect=Exception('postgres died')))
+    def test_run_cycle_role_change_reload_fails(self):
+        """A failed reload after a role change must not stop the daemon. The next cycle retries."""
+        self.p.ha.run_cycle = Mock(return_value='no action')
+        self.p.ha.dcs.watch = Mock(return_value=True)
+        self.p._last_effective_role = None
+        self.p._last_effective_pg_config = self.p.config['postgresql']
+        self.p.postgresql.set_role(PostgresqlRole.REPLICA)
+        self.p.config['postgresql']['parameters_replica'] = {'work_mem': '32MB'}
+
+        with self.assertLogs('patroni', logging.ERROR) as logs:
+            self.p._run_cycle()
+        self.assertIn('Failed to apply the postgresql configuration for role replica', logs.output[0])
+        self.assertIsNone(self.p._last_effective_role)
+
+        with self.assertLogs('patroni', logging.ERROR):
+            self.p._run_cycle()
+        self.assertEqual(Postgresql.reload_config.call_count, 2)
+
+    @patch('patroni.config.Config.save_cache', Mock())
+    @patch('patroni.config.Config.set_dynamic_configuration', Mock(return_value=False))
     @patch.object(Postgresql, 'reload_config')
     def test_run_cycle_no_reload_when_role_unchanged(self, mock_pg_reload):
         """Test that _run_cycle does not reload when role hasn't changed."""
