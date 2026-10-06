@@ -96,8 +96,9 @@ class Watchdog(object):
     """Facade to dynamically manage watchdog implementations and handle config changes.
 
     When activation fails the implementation is switched to the userspace watchdog in ``automatic`` mode (if a fence
-    function was given), otherwise to a Null implementation. To avoid log spam, a device that failed is retried only
-    on the next activation or when watchdog configuration is changed."""
+    function was given), otherwise to a Null implementation. The device is tried again at the next activation after
+    such a fallback and in ``required`` mode, and when watchdog configuration is changed. In ``automatic`` mode without
+    a fence function it is not retried, to avoid log spam: the HA loop activates on every cycle while nothing runs."""
     def __init__(self, config: Config, fence: Optional[Callable[[], None]] = None) -> None:
         """Create the facade.
 
@@ -175,7 +176,12 @@ class Watchdog(object):
             if self.impl.is_running:
                 # Do not leave an armed device behind without keepalives.
                 self._disable()
-            self.impl = self._software_fallback() if self.config.mode == MODE_AUTOMATIC else NullWatchdog()
+            if self.config.mode == MODE_AUTOMATIC:
+                self.impl = self._software_fallback()
+            else:
+                # Required mode refuses to lead below. Try the device again at the next leader attempt.
+                self.impl = NullWatchdog()
+                self._rebuild = True
             actual_timeout = self._set_timeout()
 
         if self.impl.is_running and not self.impl.can_be_disabled:

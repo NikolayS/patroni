@@ -183,6 +183,17 @@ class TestWatchdog(unittest.TestCase):
         watchdog.disable()
 
     @patch('platform.system', Mock(return_value='Linux'))
+    def test_required_mode_retries_the_device_on_next_activation(self):
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}})
+        with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device'))):
+            self.assertFalse(watchdog.activate())
+        self.assertTrue(watchdog.impl.is_null)
+        # softdog was loaded in the meantime: the next leader attempt must succeed.
+        self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, LinuxWatchdogDevice)
+        watchdog.disable()
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'get_timeout', Mock(return_value=5))
     @patch.object(LinuxWatchdogDevice, 'can_be_disabled', PropertyMock(return_value=True))
     def test_unsafe_timeout_is_not_retried_every_activation(self):
