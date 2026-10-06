@@ -133,9 +133,7 @@ class Watchdog(object):
         # delay until next time a keepalive is sent so timeout matches up with leader key update.
         if not self.active:
             if self.config.driver != self.active_config.driver or \
-               self.config.driver_config != self.active_config.driver_config or \
-               (self.active_config.mode == MODE_OFF and self.config.mode != MODE_OFF):
-                # Rebuild also when the mode goes from off to on. Off installed the null watchdog.
+               self.config.driver_config != self.active_config.driver_config:
                 self.impl = self.config.get_impl(self._fence)
             self.active_config = self.config
 
@@ -152,9 +150,10 @@ class Watchdog(object):
     def _activate(self) -> bool:
         self.active_config = self.config
 
-        if self._fallback:
-            # Try the device again. The operator may have loaded softdog,
-            # or switched the mode to required since the last activation.
+        if self._fallback or (self.impl.is_null and self.config.mode != MODE_OFF):
+            # Try the device again. The operator may have loaded softdog, switched
+            # the mode to required, or turned the watchdog back on since the last
+            # activation. The null watchdog is never the final answer while on.
             self._disable()
             self.impl = NullWatchdog() if self.config.mode == MODE_OFF else self.config.get_impl(self._fence)
             self._fallback = False

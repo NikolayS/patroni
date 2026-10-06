@@ -170,6 +170,19 @@ class TestWatchdog(unittest.TestCase):
         watchdog.disable()
 
     @patch('platform.system', Mock(return_value='Linux'))
+    def test_mode_off_then_on_while_active_rebuilds_the_watchdog(self):
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'off'}}, Mock())
+        self.assertTrue(watchdog.activate())
+        self.assertTrue(watchdog.impl.is_null)
+        watchdog.reload_config({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}})
+        # Demoted before the next keepalive applied the change, then leader again.
+        watchdog.disable()
+        self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, LinuxWatchdogDevice)
+        self.assertTrue(watchdog.is_running)
+        watchdog.disable()
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'get_support', Mock(side_effect=WatchdogError('no ioctl')))
     def test_device_closed_when_capability_query_fails(self):
         # get_support() fails in _set_timeout() and again in _disable(). The device must still be closed.
