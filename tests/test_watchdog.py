@@ -183,6 +183,18 @@ class TestWatchdog(unittest.TestCase):
         watchdog.disable()
 
     @patch('platform.system', Mock(return_value='Linux'))
+    @patch.object(LinuxWatchdogDevice, 'get_timeout', Mock(return_value=5))
+    @patch.object(LinuxWatchdogDevice, 'can_be_disabled', PropertyMock(return_value=True))
+    def test_unsafe_timeout_is_not_retried_every_activation(self):
+        # The device opens but its timeout is below loop_wait, so the null watchdog is installed on purpose.
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}, Mock())
+        self.assertTrue(watchdog.activate())
+        self.assertTrue(watchdog.impl.is_null)
+        self.assertEqual(len(mock_devices), 2)
+        self.assertTrue(watchdog.activate())  # the HA loop calls this every cycle while nothing runs
+        self.assertEqual(len(mock_devices), 2)  # the device was not opened again
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'get_support', Mock(side_effect=WatchdogError('no ioctl')))
     def test_device_closed_when_capability_query_fails(self):
         # get_support() fails in _set_timeout() and again in _disable(). The device must still be closed.

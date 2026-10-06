@@ -109,10 +109,13 @@ class Watchdog(object):
         self.lock = RLock()
         self.active = False
         self._fence = fence
-        self._fallback = False
+        # Rebuild the implementation at the next activation with the mode on. Set after a
+        # fallback, and whenever the mode was off: both leave an implementation that must not stay.
+        self._rebuild = False
 
         if self.config.mode == MODE_OFF:
             self.impl = NullWatchdog()
+            self._rebuild = True
         else:
             self.impl = self.config.get_impl(fence)
             if self.config.mode == MODE_REQUIRED and self.impl.is_null:
@@ -128,7 +131,7 @@ class Watchdog(object):
                 self._disable()
             self.active_config = self.config
             self.impl = NullWatchdog()
-            self._fallback = False
+            self._rebuild = True
         # If watchdog is not active we can apply config immediately to show any warnings early. Otherwise we need to
         # delay until next time a keepalive is sent so timeout matches up with leader key update.
         if not self.active:
@@ -150,13 +153,13 @@ class Watchdog(object):
     def _activate(self) -> bool:
         self.active_config = self.config
 
-        if self._fallback or (self.impl.is_null and self.config.mode != MODE_OFF):
+        if self._rebuild and self.config.mode != MODE_OFF:
             # Try the device again. The operator may have loaded softdog, switched
             # the mode to required, or turned the watchdog back on since the last
-            # activation. The null watchdog is never the final answer while on.
+            # activation.
             self._disable()
-            self.impl = NullWatchdog() if self.config.mode == MODE_OFF else self.config.get_impl(self._fence)
-            self._fallback = False
+            self.impl = self.config.get_impl(self._fence)
+            self._rebuild = False
 
         if self.config.timing_slack < 0:
             logger.warning('Watchdog not supported because leader TTL %s is less than 2x loop_wait %s',
@@ -212,7 +215,7 @@ class Watchdog(object):
         from patroni.watchdog.software import SoftwareWatchdog
         impl = SoftwareWatchdog(self._fence)
         impl.open()
-        self._fallback = True
+        self._rebuild = True
         logger.warning("Falling back to the userspace watchdog. It kills PostgreSQL when the HA loop hangs, "
                        "but it can not reset the host. Load the softdog module for a kernel watchdog, "
                        "or set watchdog.mode to off.")
