@@ -157,7 +157,7 @@ class Patroni(AbstractPatroniDaemon, ClusterSite, Tags):
             self.logger.update_loggers(configured_loggers)
 
     def _fence(self) -> None:
-        """Kill PostgreSQL. The software watchdog calls this when the HA loop is late."""
+        """Kill PostgreSQL. The userspace watchdog (driver ``software``) calls this when the HA loop is late."""
         self.postgresql.fence()
 
     def _get_tags(self) -> Dict[str, Any]:

@@ -142,6 +142,39 @@ class TestWatchdog(unittest.TestCase):
             self.assertTrue(watchdog.impl.is_null)
 
     @patch('platform.system', Mock(return_value='Linux'))
+    def test_fallback_then_mode_off_does_not_open_the_device(self):
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}, Mock())
+        with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError('no device'))):
+            self.assertTrue(watchdog.activate())
+        self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
+        watchdog.disable()
+        watchdog.reload_config({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'off'}})
+        with patch.object(LinuxWatchdogDevice, 'open') as mock_open:
+            self.assertTrue(watchdog.activate())
+        mock_open.assert_not_called()
+        self.assertTrue(watchdog.impl.is_null)
+
+    @patch('platform.system', Mock(return_value='Linux'))
+    @patch.object(LinuxWatchdogDevice, 'get_support', Mock(side_effect=WatchdogError('no ioctl')))
+    def test_device_closed_when_capability_query_fails(self):
+        # get_support() fails in _set_timeout() and again in _disable(). The device must still be closed.
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}})
+        with patch.object(LinuxWatchdogDevice, 'close') as mock_close:
+            self.assertFalse(watchdog.activate())
+        mock_close.assert_called_once_with()
+        self.assertTrue(watchdog.impl.is_null)
+
+    @patch('platform.system', Mock(return_value='Linux'))
+    @patch.object(LinuxWatchdogDevice, 'set_timeout', Mock(side_effect=WatchdogError('bad timeout')))
+    def test_armed_device_is_closed_before_the_fallback(self):
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}}, Mock())
+        with patch.object(LinuxWatchdogDevice, 'close') as mock_close:
+            self.assertTrue(watchdog.activate())
+        mock_close.assert_called_once_with()
+        self.assertIsInstance(watchdog.impl, SoftwareWatchdog)
+        watchdog.disable()
+
+    @patch('platform.system', Mock(return_value='Linux'))
     @patch.object(LinuxWatchdogDevice, 'is_running', PropertyMock(return_value=False))
     def test_watchdog_activate(self):
         with patch.object(LinuxWatchdogDevice, 'open', Mock(side_effect=WatchdogError(''))):

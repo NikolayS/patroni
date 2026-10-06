@@ -128,6 +128,7 @@ class Watchdog(object):
                 self._disable()
             self.active_config = self.config
             self.impl = NullWatchdog()
+            self._fallback = False
         # If watchdog is not active we can apply config immediately to show any warnings early. Otherwise we need to
         # delay until next time a keepalive is sent so timeout matches up with leader key update.
         if not self.active:
@@ -153,7 +154,7 @@ class Watchdog(object):
             # Try the device again. The operator may have loaded softdog,
             # or switched the mode to required since the last activation.
             self._disable()
-            self.impl = self.config.get_impl(self._fence)
+            self.impl = NullWatchdog() if self.config.mode == MODE_OFF else self.config.get_impl(self._fence)
             self._fallback = False
 
         if self.config.timing_slack < 0:
@@ -244,6 +245,10 @@ class Watchdog(object):
                 self.impl.keepalive()
                 logger.warning("Watchdog implementation can't be disabled. System will reboot after "
                                "%s seconds when watchdog times out.", self.impl.get_timeout())
+        except WatchdogError as e:
+            logger.error("Error while disabling watchdog: %s", e)
+        # Close in any case. A failed capability query must not leave the device open.
+        try:
             self.impl.close()
         except WatchdogError as e:
             logger.error("Error while disabling watchdog: %s", e)
