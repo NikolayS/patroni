@@ -694,6 +694,18 @@ class Postgresql(ClusterSite):
         self._postmaster_proc = PostmasterProcess.from_pidfile(self.pgcommand('postgres'), self._data_dir)
         return self._postmaster_proc
 
+    def fence(self) -> None:
+        """Kill the postmaster and all its children.
+
+        The watchdog thread calls this method when the HA loop is late.
+        Do not read or write the disk here. A stalled disk is the usual
+        reason for a late HA loop. The cached postmaster process is used.
+        """
+        postmaster = self._postmaster_proc
+        if postmaster:
+            logger.error('Fencing: killing postmaster %s and its children', postmaster.pid)
+            postmaster.signal_kill()
+
     @property
     def cb_called(self) -> bool:
         return self.__cb_called

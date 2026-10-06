@@ -101,7 +101,8 @@ config = {
     },
     "watchdog": {
         "mode": "off",
-        "device": "string"
+        "device": "string",
+        "driver": "software"
     },
     "tags": {
         "nofailover": False,
@@ -360,6 +361,12 @@ class TestValidator(unittest.TestCase):
             output = "\n".join(errors)
             self.assertEqual(['bootstrap.dcs.standby_cluster.port', 'postgresql.bin_dir',
                               'raft.bind_addr', 'raft.self_addr'], parse_output(output))
+
+    def test_watchdog_driver(self, _, __):
+        c = copy.deepcopy(config)
+        c["watchdog"]["driver"] = "hardware"
+        errors = schema(c)
+        self.assertIn("watchdog.driver", "\n".join(errors))
 
     def test_one_of(self, _, __):
         c = copy.deepcopy(config)

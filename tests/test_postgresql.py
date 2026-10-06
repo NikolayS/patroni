@@ -468,6 +468,15 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertEqual(self.p.timeline_wal_position(), (1, 2, 1, 1, 1))
         Thread(target=self.p.timeline_wal_position).start()
 
+    def test_fence(self):
+        self.p._postmaster_proc = None
+        self.p.fence()  # nothing to kill, no error
+        mock_postmaster = self.p._postmaster_proc = MockPostmaster()
+        mock_postmaster.pid = 123
+        mock_postmaster.signal_kill = Mock()
+        self.p.fence()
+        mock_postmaster.signal_kill.assert_called_once_with()
+
     @patch.object(PostmasterProcess, 'from_pidfile')
     def test_is_running(self, mock_frompidfile):
         # Cached postmaster running

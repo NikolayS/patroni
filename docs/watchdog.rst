@@ -13,18 +13,27 @@ Having multiple PostgreSQL servers running as primary can result in transactions
 
 To guarantee correct behavior under these conditions Patroni supports watchdog devices. Watchdog devices are software or hardware mechanisms that will reset the whole system when they do not get a keepalive heartbeat within a specified timeframe. This adds an additional layer of fail safe in case usual Patroni split-brain protection mechanisms fail.
 
-Patroni will try to activate the watchdog before promoting PostgreSQL to primary. If watchdog activation fails and watchdog mode is ``required`` then the node will refuse to become leader. When deciding to participate in leader election Patroni will also check that watchdog configuration will allow it to become leader at all. After demoting PostgreSQL (for example due to a manual failover) Patroni will disable the watchdog again. Watchdog will also be disabled while Patroni is in paused state.
+Patroni will try to activate the watchdog before promoting PostgreSQL to primary. If watchdog activation fails and watchdog mode is ``required`` then the node will refuse to become leader. In ``automatic`` mode Patroni falls back to a userspace watchdog instead (see `Userspace watchdog`_ below). When deciding to participate in leader election Patroni will also check that watchdog configuration will allow it to become leader at all. After demoting PostgreSQL (for example due to a manual failover) Patroni will disable the watchdog again. Watchdog will also be disabled while Patroni is in paused state.
 
 By default Patroni will set up the watchdog to expire 5 seconds before TTL expires. With the default setup of ``loop_wait=10`` and ``ttl=30`` this gives HA loop at least 15 seconds (``ttl`` - ``safety_margin`` - ``loop_wait``) to complete before the system gets forcefully reset. By default accessing DCS is configured to time out after 10 seconds. This means that when DCS is unavailable, for example due to network issues, Patroni and PostgreSQL will have at least 5 seconds (``ttl`` - ``safety_margin`` - ``loop_wait`` - ``retry_timeout``) to come to a state where all client connections are terminated.
 
 Safety margin is the amount of time that Patroni reserves for time between leader key update and watchdog keepalive. Patroni will try to send a keepalive immediately after confirmation of leader key update. If Patroni process is suspended for extended amount of time at exactly the right moment the keepalive may be delayed for more than the safety margin without triggering the watchdog. This results in a window of time where watchdog will not trigger before leader key expiration, invalidating the guarantee. To be absolutely sure that watchdog will trigger under all circumstances set up the watchdog to expire after half of TTL by setting ``safety_margin`` to -1 to set watchdog timeout to ``ttl // 2``. If you need this guarantee you probably should increase ``ttl`` and/or reduce ``loop_wait`` and ``retry_timeout``.
 
-Currently watchdogs are only supported using Linux watchdog device interface.
+Currently the kernel watchdog is only supported using the Linux watchdog device interface. The userspace watchdog described below works on every platform; on platforms other than Linux it is used only when ``watchdog.driver: software`` is set.
 
-Setting up software watchdog on Linux
--------------------------------------
+Userspace watchdog
+------------------
 
-Default Patroni configuration will try to use ``/dev/watchdog`` on Linux if it is accessible to Patroni. For most use cases using software watchdog built into the Linux kernel is secure enough.
+Patroni also includes a watchdog implemented as a thread inside the Patroni process. When the HA loop does not send a keepalive in time, the thread kills PostgreSQL (the postmaster and all its children) with ``SIGKILL``. It uses the postmaster process that Patroni already knows; it does not read the data directory, and its log messages go through the Patroni log queue. So it still works when a disk stall blocks the HA loop in the kernel.
+
+In ``automatic`` mode, when the kernel device can not be activated, Patroni falls back to this thread and logs a warning. The device is tried again on the next activation, so loading ``softdog`` takes effect at the next leader election. In the configuration this watchdog is the ``software`` driver (the name refers to the thread, not to the kernel ``softdog`` module). Set ``watchdog.driver: software`` to use it instead of a kernel device from the start. The ``device`` option is ignored with this driver.
+
+This is weaker than a kernel watchdog. It can not reset the host, and it does not help when the whole Patroni process is frozen or killed. Prefer the kernel ``softdog`` module described in the next section where it is available.
+
+Setting up softdog (kernel software watchdog) on Linux
+------------------------------------------------------
+
+Default Patroni configuration will try to use ``/dev/watchdog`` on Linux if it is accessible to Patroni, and falls back to the userspace watchdog if it is not. For most use cases using the software watchdog built into the Linux kernel is secure enough.
 
 To enable software watchdog issue the following commands as root before starting Patroni:
 

@@ -60,10 +60,20 @@ class WatchdogConfig(object):
     def __ne__(self, other: Any) -> bool:
         return not self == other
 
-    def get_impl(self) -> 'WatchdogBase':
+    def get_impl(self, fence: Optional[Callable[[], None]] = None) -> 'WatchdogBase':
+        """Create the watchdog implementation for the configured driver.
+
+        :param fence: function for the ``software`` driver to call when a keepalive is late. Without it the
+                      ``software`` driver is not available and the null watchdog is returned.
+
+        :returns: the watchdog implementation for the configured driver.
+        """
         if self.driver == 'testing':  # pragma: no cover
             from patroni.watchdog.linux import TestingWatchdogDevice
             return TestingWatchdogDevice.from_config(self.driver_config)
+        elif self.driver == 'software' and fence is not None:
+            from patroni.watchdog.software import SoftwareWatchdog
+            return SoftwareWatchdog(fence)
         elif platform.system() == 'Linux' and self.driver == 'default':
             from patroni.watchdog.linux import LinuxWatchdogDevice
             return LinuxWatchdogDevice.from_config(self.driver_config)
@@ -85,18 +95,30 @@ class WatchdogConfig(object):
 class Watchdog(object):
     """Facade to dynamically manage watchdog implementations and handle config changes.
 
-    When activation fails underlying implementation will be switched to a Null implementation. To avoid log spam
-    activation will only be retried when watchdog configuration is changed."""
-    def __init__(self, config: Config) -> None:
+    When activation fails the implementation is switched to the userspace watchdog in ``automatic`` mode (if a fence
+    function was given), otherwise to a Null implementation. The device is tried again at the next activation after
+    such a fallback and in ``required`` mode, and when watchdog configuration is changed. In ``automatic`` mode without
+    a fence function it is not retried, to avoid log spam: the HA loop activates on every cycle while nothing runs."""
+    def __init__(self, config: Config, fence: Optional[Callable[[], None]] = None) -> None:
+        """Create the facade.
+
+        :param config: Patroni configuration.
+        :param fence: function for the ``software`` driver to call when a keepalive is late.
+        """
         self.config = WatchdogConfig(config)
         self.active_config: WatchdogConfig = self.config
         self.lock = RLock()
         self.active = False
+        self._fence = fence
+        # Rebuild the implementation at the next activation with the mode on. Set after a
+        # fallback, and whenever the mode was off: both leave an implementation that must not stay.
+        self._rebuild = False
 
         if self.config.mode == MODE_OFF:
             self.impl = NullWatchdog()
+            self._rebuild = True
         else:
-            self.impl = self.config.get_impl()
+            self.impl = self.config.get_impl(fence)
             if self.config.mode == MODE_REQUIRED and self.impl.is_null:
                 logger.error("Configuration requires a watchdog, but watchdog is not supported on this platform.")
                 sys.exit(1)
@@ -110,12 +132,13 @@ class Watchdog(object):
                 self._disable()
             self.active_config = self.config
             self.impl = NullWatchdog()
+            self._rebuild = True
         # If watchdog is not active we can apply config immediately to show any warnings early. Otherwise we need to
         # delay until next time a keepalive is sent so timeout matches up with leader key update.
         if not self.active:
             if self.config.driver != self.active_config.driver or \
                self.config.driver_config != self.active_config.driver_config:
-                self.impl = self.config.get_impl()
+                self.impl = self.config.get_impl(self._fence)
             self.active_config = self.config
 
     @synchronized
@@ -131,6 +154,14 @@ class Watchdog(object):
     def _activate(self) -> bool:
         self.active_config = self.config
 
+        if self._rebuild and self.config.mode != MODE_OFF:
+            # Try the device again. The operator may have loaded softdog, switched
+            # the mode to required, or turned the watchdog back on since the last
+            # activation.
+            self._disable()
+            self.impl = self.config.get_impl(self._fence)
+            self._rebuild = False
+
         if self.config.timing_slack < 0:
             logger.warning('Watchdog not supported because leader TTL %s is less than 2x loop_wait %s',
                            self.config.ttl, self.config.loop_wait)
@@ -142,8 +173,16 @@ class Watchdog(object):
         except WatchdogError as e:
             log = logger.warning if self.config.mode == MODE_REQUIRED else logger.debug
             log("Could not activate %s: %s", self.impl.describe(), e)
-            self.impl = NullWatchdog()
-            actual_timeout = self.impl.get_timeout()
+            if self.impl.is_running:
+                # Do not leave an armed device behind without keepalives.
+                self._disable()
+            if self.config.mode == MODE_AUTOMATIC:
+                self.impl = self._software_fallback()
+            else:
+                # Required mode refuses to lead below. Try the device again at the next leader attempt.
+                self.impl = NullWatchdog()
+                self._rebuild = True
+            actual_timeout = self._set_timeout()
 
         if self.impl.is_running and not self.impl.can_be_disabled:
             logger.warning("Watchdog implementation can't be disabled."
@@ -171,6 +210,22 @@ class Watchdog(object):
                 return False
 
         return True
+
+    def _software_fallback(self) -> 'WatchdogBase':
+        """Open a userspace watchdog in place of a device that could not be activated.
+
+        :returns: the opened userspace watchdog, or the null watchdog if there is no fence function.
+        """
+        if self._fence is None:
+            return NullWatchdog()
+        from patroni.watchdog.software import SoftwareWatchdog
+        impl = SoftwareWatchdog(self._fence)
+        impl.open()
+        self._rebuild = True
+        logger.warning("Falling back to the userspace watchdog. It kills PostgreSQL when the HA loop hangs, "
+                       "but it can not reset the host. Load the softdog module for a kernel watchdog, "
+                       "or set watchdog.mode to off.")
+        return impl
 
     def _set_timeout(self) -> Optional[int]:
         if self.impl.has_set_timeout():
@@ -200,6 +255,10 @@ class Watchdog(object):
                 self.impl.keepalive()
                 logger.warning("Watchdog implementation can't be disabled. System will reboot after "
                                "%s seconds when watchdog times out.", self.impl.get_timeout())
+        except WatchdogError as e:
+            logger.error("Error while disabling watchdog: %s", e)
+        # Close in any case. A failed capability query must not leave the device open.
+        try:
             self.impl.close()
         except WatchdogError as e:
             logger.error("Error while disabling watchdog: %s", e)
@@ -212,12 +271,12 @@ class Watchdog(object):
             # In case there are any pending configuration changes apply them now.
             if self.active and self.config != self.active_config:
                 if self.config.mode != MODE_OFF and self.active_config.mode == MODE_OFF:
-                    self.impl = self.config.get_impl()
+                    self.impl = self.config.get_impl(self._fence)
                     self._activate()
                 if self.config.driver != self.active_config.driver \
                    or self.config.driver_config != self.active_config.driver_config:
                     self._disable()
-                    self.impl = self.config.get_impl()
+                    self.impl = self.config.get_impl(self._fence)
                     self._activate()
                 if self.config.timeout != self.active_config.timeout:
                     self.impl.set_timeout(self.config.timeout)
@@ -238,7 +297,9 @@ class Watchdog(object):
     def is_healthy(self) -> bool:
         if self.config.mode != MODE_REQUIRED:
             return True
-        return self.config.timing_slack >= 0 and self.impl.is_healthy
+        # After a failure the implementation is a placeholder. Ask the device that the next activation will try.
+        impl = self.config.get_impl(self._fence) if self._rebuild else self.impl
+        return self.config.timing_slack >= 0 and impl.is_healthy
 
 
 class WatchdogBase(abc.ABC):
