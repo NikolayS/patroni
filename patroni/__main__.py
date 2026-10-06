@@ -245,11 +245,16 @@ class Patroni(AbstractPatroniDaemon, ClusterSite, Tags):
                 and self.config.set_dynamic_configuration(self.dcs.cluster.config):
             self.reload_config()
         elif self._last_effective_role != ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role):
-            self._last_effective_role = ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role)
             new_effective_pg_config = self.config.build_effective_postgresql_configuration(self.postgresql.role)
-            if not deep_compare(self._last_effective_pg_config, new_effective_pg_config):
+            try:
+                if not deep_compare(self._last_effective_pg_config, new_effective_pg_config):
+                    self.postgresql.reload_config(new_effective_pg_config)
+            except Exception:
+                # Postgres can die right after the role change. Try again on the next cycle.
+                logger.exception('Failed to apply the postgresql configuration for role %s', self.postgresql.role)
+            else:
+                self._last_effective_role = ROLE_CONFIG_SUFFIX_MAP.get(self.postgresql.role)
                 self._last_effective_pg_config = new_effective_pg_config
-                self.postgresql.reload_config(self._last_effective_pg_config)
 
         if self.postgresql.role != PostgresqlRole.UNINITIALIZED:
             self.config.save_cache()
