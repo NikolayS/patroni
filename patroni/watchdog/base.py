@@ -142,6 +142,8 @@ class Watchdog(object):
         except WatchdogError as e:
             log = logger.warning if self.config.mode == MODE_REQUIRED else logger.debug
             log("Could not activate %s: %s", self.impl.describe(), e)
+            if self.impl.is_running:
+                self._disable()
             self.impl = NullWatchdog()
             actual_timeout = self.impl.get_timeout()
 
@@ -200,6 +202,10 @@ class Watchdog(object):
                 self.impl.keepalive()
                 logger.warning("Watchdog implementation can't be disabled. System will reboot after "
                                "%s seconds when watchdog times out.", self.impl.get_timeout())
+        except WatchdogError as e:
+            logger.error("Error while disabling watchdog: %s", e)
+        # A failed capability query must not prevent closing the device.
+        try:
             self.impl.close()
         except WatchdogError as e:
             logger.error("Error while disabling watchdog: %s", e)

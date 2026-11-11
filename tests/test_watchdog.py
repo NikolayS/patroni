@@ -99,6 +99,28 @@ class TestWatchdog(unittest.TestCase):
         self.assertFalse(Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}}).activate())
 
     @patch('platform.system', Mock(return_value='Linux'))
+    def test_activation_failure_closes_open_device(self):
+        for mode in ('automatic', 'required'):
+            for method in ('set_timeout', 'get_support', 'get_timeout'):
+                with self.subTest(mode=mode, method=method):
+                    watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': mode}})
+                    with patch.object(LinuxWatchdogDevice, method, side_effect=WatchdogError('injected failure')):
+                        self.assertEqual(watchdog.activate(), mode == 'automatic')
+                    self.assertTrue(watchdog.impl.is_null)
+                    # Exercise LinuxWatchdogDevice.close(), not a mock of close().
+                    self.assertFalse(mock_devices[-1].open)
+                    self.assertEqual(mock_devices[-1].writes[-1], b'V')
+
+    @patch('platform.system', Mock(return_value='Linux'))
+    def test_failed_open_keeps_automatic_mode_quiet(self):
+        watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'automatic'}})
+        with patch.object(LinuxWatchdogDevice, 'open', side_effect=WatchdogError('missing device')), \
+                self.assertLogs('patroni.watchdog.base', level='DEBUG') as logs:
+            self.assertTrue(watchdog.activate())
+        self.assertEqual([record.levelname for record in logs.records], ['DEBUG'])
+        self.assertEqual(len(mock_devices), 1)
+
+    @patch('platform.system', Mock(return_value='Linux'))
     def test_basic_operation(self):
         watchdog = Watchdog({'ttl': 30, 'loop_wait': 10, 'watchdog': {'mode': 'required'}})
         watchdog.activate()
