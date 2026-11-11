@@ -15,11 +15,10 @@ import os
 import socket
 import sys
 import time
-import traceback
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address, ip_network, IPv4Network, IPv6Network
-from socketserver import ThreadingMixIn
+from socketserver import TCPServer, ThreadingMixIn
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import parse_qs, urlparse
 
@@ -950,7 +949,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 status_code = 422
             else:
                 status_code = None
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, ArithmeticError):
             logger.exception('Invalid scheduled %s time: %s', action, schedule)
             error = 'Unable to parse scheduled timestamp. It should be in an unambiguous format, e.g. ISO 8601'
             status_code = 422
@@ -1515,7 +1514,11 @@ class RestApiHandler(BaseHTTPRequestHandler):
             This is only used to keep track of latency when logging messages through :func:`log_message`.
         """
         self.__start_time = time.monotonic()
-        BaseHTTPRequestHandler.handle_one_request(self)
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        except Exception:
+            self.send_error(503)
+            raise
 
     def log_message(self, format: str, *args: Any) -> None:
         """Log a custom ``debug`` message.
@@ -1747,6 +1750,16 @@ class RestApiServer(ThreadingMixIn, HTTPServer):
             headers = {'WWW-Authenticate': 'Basic realm="' + self.patroni.__class__.__name__ + '"'}
             return rh.write_response(401, reason, headers=headers)
         return True
+
+    def server_bind(self) -> None:
+        """Bind the REST API socket without resolving its address to a hostname.
+
+        ``HTTPServer.server_bind`` performs a reverse DNS lookup that Patroni does not need and that can block startup
+        when name resolution is slow.
+        """
+        TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = self.server_address[1]
 
     @staticmethod
     def __has_dual_stack() -> bool:
@@ -2072,11 +2085,11 @@ class RestApiServer(ThreadingMixIn, HTTPServer):
                      client_address: Tuple[str, int]) -> None:
         """Handle any exception that is thrown while handling a request to the REST API.
 
-        Logs ``WARNING`` messages with the client information, and the stack trace of the faced exception.
+        Logs a ``WARNING`` message with client information and exception details.
+        Traceback formatting is left to the logging handler.
 
         :param request: the request that faced an exception.
         :param client_address: a tuple composed of the IP and port of the client connection.
         """
         logger.warning('Exception happened during processing of request from %s:%s',
-                       client_address[0], client_address[1])
-        logger.warning(traceback.format_exc())
+                       client_address[0], client_address[1], exc_info=True)
